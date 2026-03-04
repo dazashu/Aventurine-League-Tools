@@ -228,20 +228,20 @@ class LOL_OT_CheckForUpdates(bpy.types.Operator):
                     if download_url == latest.get('zipball_url', ''):
                         download_url = asset['browser_download_url']
 
-            if new_version > current_version:
-                _set_prefs(
-                    update_available=True,
-                    latest_version_str=tag_name,
-                    download_url=download_url,
-                    update_status=f"Update available: {tag_name}"
-                )
+            is_newer = new_version > current_version
+
+            if is_newer:
+                status = f"Update available: {tag_name}"
             else:
-                _set_prefs(
-                    update_available=True,
-                    latest_version_str=tag_name,
-                    download_url=download_url,
-                    update_status=f"Up to date ({tag_name}) - re-download available"
-                )
+                status = f"Up to date ({tag_name})"
+
+            _set_prefs(
+                update_available=True,
+                update_is_newer=is_newer,
+                latest_version_str=tag_name,
+                download_url=download_url,
+                update_status=status
+            )
 
         except Exception as e:
             _set_prefs(update_status=f"Check failed: {e}")
