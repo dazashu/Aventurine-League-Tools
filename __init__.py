@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Aventurine: League Tools",
     "author": "Bud and Frog",
-    "version": (2, 6, 0),
+    "version": (2, 6, 1),
     "blender": (4, 0, 0),
     "location": "File > Import-Export",
     "description": "Plugin for working with League of Legends 3D assets natively",
@@ -566,6 +566,12 @@ class ExportSKN(bpy.types.Operator, ExportHelper):
         default=False
     )
 
+    use_visual_pose: BoolProperty(
+        name="Use Visual Rest Pose (Experimental)",
+        description="Export bones using their current visual rest pose instead of the original imported transforms. Enable this if you moved bones in Edit Mode and want the changes to be exported",
+        default=False
+    )
+
     target_armature_name: StringProperty(options={'HIDDEN'})
 
     def invoke(self, context, event):
@@ -594,7 +600,7 @@ class ExportSKN(bpy.types.Operator, ExportHelper):
     def execute(self, context):
         from .io import export_skn
         target_armature = context.scene.objects.get(self.target_armature_name) if self.target_armature_name else None
-        return export_skn.save(self, context, self.filepath, self.export_skl, self.clean_names, target_armature=target_armature, disable_scaling=self.disable_scaling, disable_transforms=self.disable_transforms)
+        return export_skn.save(self, context, self.filepath, self.export_skl, self.clean_names, target_armature=target_armature, disable_scaling=self.disable_scaling, disable_transforms=self.disable_transforms, use_visual_pose=self.use_visual_pose)
 
 # Export operator for SKL
 class ExportSKL(bpy.types.Operator, ExportHelper):
@@ -620,6 +626,12 @@ class ExportSKL(bpy.types.Operator, ExportHelper):
     disable_transforms: BoolProperty(
         name="Disable Transforms",
         description="Disable coordinate system conversion (Y-up to Z-up transformation)",
+        default=False
+    )
+
+    use_visual_pose: BoolProperty(
+        name="Use Visual Rest Pose (Experimental)",
+        description="Export bones using their current visual rest pose instead of the original imported transforms. Enable this if you moved bones in Edit Mode and want the changes to be exported",
         default=False
     )
 
@@ -654,7 +666,7 @@ class ExportSKL(bpy.types.Operator, ExportHelper):
     def execute(self, context):
         from .io import export_skl
         target_armature = context.scene.objects.get(self.target_armature_name) if self.target_armature_name else None
-        return export_skl.save(self, context, self.filepath, target_armature=target_armature, disable_scaling=self.disable_scaling, disable_transforms=self.disable_transforms)
+        return export_skl.save(self, context, self.filepath, target_armature=target_armature, disable_scaling=self.disable_scaling, disable_transforms=self.disable_transforms, use_visual_pose=self.use_visual_pose)
 
 # Export operator for ANM
 class ExportANM(bpy.types.Operator, ExportHelper):

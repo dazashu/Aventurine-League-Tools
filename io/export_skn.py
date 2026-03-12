@@ -41,7 +41,7 @@ def check_shared_vertices_between_materials(mesh_obj):
     return list(shared_materials)
 
 
-def collect_mesh_data(mesh_obj, armature_obj, bone_to_idx, submesh_name, material_index=None, disable_scaling=False, disable_transforms=False):
+def collect_mesh_data(mesh_obj, armature_obj, bone_to_idx, submesh_name, material_index=None, disable_scaling=False, disable_transforms=False, deformed_positions=None, deformed_poly_normals=None):
     """
     Collect geometry data from a single mesh object.
     If material_index is specified, only collect triangles belonging to that material.
@@ -90,8 +90,9 @@ def collect_mesh_data(mesh_obj, armature_obj, bone_to_idx, submesh_name, materia
         for v_idx in poly.vertices:
             if v_idx not in vertex_normals:
                 vertex_normals[v_idx] = []
-            # Store face normal for this vertex
-            vertex_normals[v_idx].append(poly.normal)
+            # Use deformed face normal if available (for visual pose export)
+            normal = deformed_poly_normals.get(poly.index, poly.normal) if deformed_poly_normals else poly.normal
+            vertex_normals[v_idx].append(normal)
     
     # Average the normals for each vertex
     averaged_normals = {}
@@ -121,8 +122,9 @@ def collect_mesh_data(mesh_obj, armature_obj, bone_to_idx, submesh_name, materia
             if vert_key not in unique_verts:
                 v = mesh.vertices[v_idx]
 
-                # Position
-                v_B = world_to_armature @ v.co
+                # Position - use deformed if available (for visual pose export)
+                v_co = deformed_positions[v_idx] if deformed_positions else v.co
+                v_B = world_to_armature @ v_co
                 if disable_transforms:
                     v_L = mathutils.Vector((v_B.x * scale, v_B.y * scale, v_B.z * scale))
                 else:
@@ -194,7 +196,7 @@ def collect_mesh_data(mesh_obj, armature_obj, bone_to_idx, submesh_name, materia
     }
 
 
-def write_skn_multi(filepath, mesh_objects, armature_obj, clean_names=True, disable_scaling=False, disable_transforms=False):
+def write_skn_multi(filepath, mesh_objects, armature_obj, clean_names=True, disable_scaling=False, disable_transforms=False, use_visual_pose=False):
     """Write multiple Blender meshes to a single SKN file with multiple submeshes"""
 
     print("\n=== SKN EXPORT DEBUG ===")
@@ -224,6 +226,25 @@ def write_skn_multi(filepath, mesh_objects, armature_obj, clean_names=True, disa
             if cleaned != bone.name:
                 bone_to_idx[cleaned] = i
 
+    # If use_visual_pose, evaluate meshes at frame 0 with armature deformation
+    # This gives us vertex positions that match the new bind pose from the SKL
+    deformed_data = {}
+    if use_visual_pose:
+        current_frame = bpy.context.scene.frame_current
+        bpy.context.scene.frame_set(0)
+        bpy.context.view_layer.update()
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        for obj in mesh_objects:
+            if obj.type != 'MESH':
+                continue
+            eval_obj = obj.evaluated_get(depsgraph)
+            eval_mesh = eval_obj.to_mesh()
+            positions = {vi: eval_mesh.vertices[vi].co.copy() for vi in range(len(eval_mesh.vertices))}
+            poly_normals = {p.index: p.normal.copy() for p in eval_mesh.polygons}
+            deformed_data[obj.name] = (positions, poly_normals)
+            eval_obj.to_mesh_clear()
+        bpy.context.scene.frame_set(current_frame)
+
     submesh_data = []
     total_vertex_count = 0
     total_index_count = 0
@@ -233,6 +254,7 @@ def write_skn_multi(filepath, mesh_objects, armature_obj, clean_names=True, disa
             continue
 
         mesh = mesh_obj.data
+        deformed_pos, deformed_norms = deformed_data.get(mesh_obj.name, (None, None))
         print(f"Processing mesh: '{mesh_obj.name}' with {len(mesh.materials)} material slots")
         for i, mat in enumerate(mesh.materials):
             mat_name = mat.name if mat else "(None)"
@@ -264,7 +286,9 @@ def write_skn_multi(filepath, mesh_objects, armature_obj, clean_names=True, disa
                 data = collect_mesh_data(mesh_obj, armature_obj, bone_to_idx, submesh_name,
                                         material_index=mat_idx,
                                         disable_scaling=disable_scaling,
-                                        disable_transforms=disable_transforms)
+                                        disable_transforms=disable_transforms,
+                                        deformed_positions=deformed_pos,
+                                        deformed_poly_normals=deformed_norms)
 
                 if data is None or not data['indices']:
                     continue
@@ -294,7 +318,9 @@ def write_skn_multi(filepath, mesh_objects, armature_obj, clean_names=True, disa
             data = collect_mesh_data(mesh_obj, armature_obj, bone_to_idx, submesh_name,
                                     material_index=None,
                                     disable_scaling=disable_scaling,
-                                    disable_transforms=disable_transforms)
+                                    disable_transforms=disable_transforms,
+                                    deformed_positions=deformed_pos,
+                                    deformed_poly_normals=deformed_norms)
 
             if data is None or not data['indices']:
                 continue
@@ -357,7 +383,7 @@ def write_skn_multi(filepath, mesh_objects, armature_obj, clean_names=True, disa
     return len(submesh_data), total_vertex_count
 
 
-def save(operator, context, filepath, export_skl_file=True, clean_names=True, target_armature=None, disable_scaling=False, disable_transforms=False):
+def save(operator, context, filepath, export_skl_file=True, clean_names=True, target_armature=None, disable_scaling=False, disable_transforms=False, use_visual_pose=False):
     armature_obj = target_armature
     mesh_objects = []
     
@@ -398,13 +424,13 @@ def save(operator, context, filepath, export_skl_file=True, clean_names=True, ta
         return {'CANCELLED'}
     
     try:
-        submesh_count, vertex_count = write_skn_multi(filepath, mesh_objects, armature_obj, clean_names, disable_scaling, disable_transforms)
+        submesh_count, vertex_count = write_skn_multi(filepath, mesh_objects, armature_obj, clean_names, disable_scaling, disable_transforms, use_visual_pose)
         operator.report({'INFO'}, f"Exported SKN: {submesh_count} submeshes, {vertex_count} vertices")
 
         if export_skl_file and armature_obj:
             skl_path = os.path.splitext(filepath)[0] + ".skl"
             from . import export_skl
-            export_skl.write_skl(skl_path, armature_obj, disable_scaling, disable_transforms)
+            export_skl.write_skl(skl_path, armature_obj, disable_scaling, disable_transforms, use_visual_pose)
             operator.report({'INFO'}, f"Exported matching SKL: {skl_path}")
             
         return {'FINISHED'}

@@ -4,7 +4,7 @@ import os
 from ..utils.binary_utils import BinaryStream, Hash
 from . import import_skl
 
-def write_skl(filepath, armature_obj, disable_scaling=False, disable_transforms=False):
+def write_skl(filepath, armature_obj, disable_scaling=False, disable_transforms=False, use_visual_pose=False):
     """Write Blender armature to SKL file (Version 0)"""
 
     # Coordinate conversion matrix P (X-mirror + Y-up to Z-up)
@@ -30,30 +30,55 @@ def write_skl(filepath, armature_obj, disable_scaling=False, disable_transforms=
     bone_name_to_index = {b.name: i for i, b in enumerate(bone_list)}
     
     joint_count = len(bone_list)
-    
+
     # --- Pre-calculate Matrices (Recursive) to handle Mix of Native/New bones ---
     # format: [bone_index] = (Matrix_Global_League, Matrix_Local_League)
-    
-    league_matrices = {} 
-    
+
+    league_matrices = {}
+
+    # If use_visual_pose, evaluate frame 0 to get the posed transforms
+    frame0_matrices = {}
+    if use_visual_pose:
+        current_frame = bpy.context.scene.frame_current
+        bpy.context.scene.frame_set(0)
+        bpy.context.view_layer.update()
+        for pbone in bone_list:
+            # pbone.matrix is the final world-space posed matrix at frame 0
+            frame0_matrices[pbone.name] = pbone.matrix.copy()
+        bpy.context.scene.frame_set(current_frame)
+
     def calc_league_matrix(bone_idx):
         if bone_idx in league_matrices:
             return league_matrices[bone_idx]
-            
+
         pbone = bone_list[bone_idx]
-        
+
         # 1. Determine Local League Matrix
         nb_t = pbone.get("native_bind_t")
         nb_r = pbone.get("native_bind_r")
         nb_s = pbone.get("native_bind_s")
-        
-        if nb_t and nb_r and nb_s:
+
+        if nb_t and nb_r and nb_s and not use_visual_pose:
             # Use Original Native Bind (Preserves offsets and orientation)
             # This ignores Blender's visual edits to Head/Tail, which is GOOD for game compatibility
             lm_t = mathutils.Matrix.Translation(mathutils.Vector(nb_t))
             lm_r = mathutils.Quaternion(nb_r).to_matrix().to_4x4()
             lm_s = mathutils.Matrix.Diagonal((nb_s[0], nb_s[1], nb_s[2], 1.0))
             l_mat_local = lm_t @ lm_r @ lm_s
+        elif use_visual_pose and pbone.name in frame0_matrices:
+            # Experimental: Use the posed transform at frame 0
+            b_global = frame0_matrices[pbone.name]
+            if pbone.parent and pbone.parent.name in frame0_matrices:
+                parent_global = frame0_matrices[pbone.parent.name]
+                try:
+                    b_local = parent_global.inverted() @ b_global
+                except ValueError:
+                    b_local = b_global
+            else:
+                b_local = b_global
+
+            # Convert to League: L = P_inv @ B @ P
+            l_mat_local = P_inv @ b_local @ P
         else:
             # New Bone or Missing Data: Convert Blender Rest Pose to League
             # Blender Local: Parent_Inv @ Child
@@ -64,19 +89,19 @@ def write_skl(filepath, armature_obj, disable_scaling=False, disable_transforms=
                     b_local = pbone.bone.matrix_local
             else:
                 b_local = pbone.bone.matrix_local
-            
+
             # Convert to League: L = P_inv @ B @ P
             l_mat_local = P_inv @ b_local @ P
-            
+
         # 2. Determine Global League Matrix
         parent_idx = bone_name_to_index.get(pbone.parent.name) if pbone.parent else -1
-        
+
         if parent_idx >= 0:
             parent_global, _ = calc_league_matrix(parent_idx)
             l_mat_global = parent_global @ l_mat_local
         else:
             l_mat_global = l_mat_local
-            
+
         league_matrices[bone_idx] = (l_mat_global, l_mat_local)
         return l_mat_global, l_mat_local
 
@@ -181,7 +206,7 @@ def write_skl(filepath, armature_obj, disable_scaling=False, disable_transforms=
         
     return True
 
-def save(operator, context, filepath, target_armature=None, disable_scaling=False, disable_transforms=False):
+def save(operator, context, filepath, target_armature=None, disable_scaling=False, disable_transforms=False, use_visual_pose=False):
     armature_obj = target_armature
 
     if not armature_obj:
@@ -195,7 +220,7 @@ def save(operator, context, filepath, target_armature=None, disable_scaling=Fals
         return {'CANCELLED'}
 
     try:
-        write_skl(filepath, armature_obj, disable_scaling, disable_transforms)
+        write_skl(filepath, armature_obj, disable_scaling, disable_transforms, use_visual_pose)
         operator.report({'INFO'}, f"Exported SKL: {filepath}")
         return {'FINISHED'}
     except Exception as e:
