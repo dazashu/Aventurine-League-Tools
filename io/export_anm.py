@@ -20,7 +20,17 @@ def write_anm(filepath, armature_obj, fps=30.0, disable_scaling=False, disable_t
         P = mathutils.Matrix(((-1, 0, 0, 0), (0, 0, -1, 0), (0, 1, 0, 0), (0, 0, 0, 1)))
         P_inv = P.inverted()
     
-    bones = list(armature_obj.pose.bones)
+    # Sort bones by original import order (matching SKL export ordering)
+    native_bones = []
+    new_bones = []
+    for b in armature_obj.pose.bones:
+        idx = b.get("native_bone_index")
+        if idx is not None:
+            native_bones.append((int(idx), b))
+        else:
+            new_bones.append(b)
+    native_bones.sort(key=lambda x: x[0])
+    bones = [b for _, b in native_bones] + new_bones
     
     # Frame range - skip frame 0 (bind pose) to match Maya's behavior
     # Import puts bind at frame 0, animation starts at frame 1

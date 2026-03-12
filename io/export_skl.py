@@ -15,9 +15,18 @@ def write_skl(filepath, armature_obj, disable_scaling=False, disable_transforms=
         P = mathutils.Matrix(((-1, 0, 0, 0), (0, 0, -1, 0), (0, 1, 0, 0), (0, 0, 0, 1)))
         P_inv = P.inverted()
     
-    # Get bones and preserve order
+    # Get bones sorted by original import order (native bones first, new bones appended)
     bones = armature_obj.pose.bones
-    bone_list = list(bones)
+    native_bones = []
+    new_bones = []
+    for b in bones:
+        idx = b.get("native_bone_index")
+        if idx is not None:
+            native_bones.append((int(idx), b))
+        else:
+            new_bones.append(b)
+    native_bones.sort(key=lambda x: x[0])
+    bone_list = [b for _, b in native_bones] + new_bones
     bone_name_to_index = {b.name: i for i, b in enumerate(bone_list)}
     
     joint_count = len(bone_list)
@@ -49,7 +58,10 @@ def write_skl(filepath, armature_obj, disable_scaling=False, disable_transforms=
             # New Bone or Missing Data: Convert Blender Rest Pose to League
             # Blender Local: Parent_Inv @ Child
             if pbone.parent:
-                b_local = pbone.parent.bone.matrix_local.inverted() @ pbone.bone.matrix_local
+                try:
+                    b_local = pbone.parent.bone.matrix_local.inverted() @ pbone.bone.matrix_local
+                except ValueError:
+                    b_local = pbone.bone.matrix_local
             else:
                 b_local = pbone.bone.matrix_local
             
@@ -134,7 +146,12 @@ def write_skl(filepath, armature_obj, disable_scaling=False, disable_transforms=
             bs.write_quat(l_r)
             
             # Inversed Global Transform (Bind Matrix Inv)
-            ig_mat = l_mat_global.inverted()
+            # Some LoL bones have zero scale (used to hide bones), making the global
+            # matrix singular. Fall back to identity since no verts are weighted to them.
+            try:
+                ig_mat = l_mat_global.inverted()
+            except ValueError:
+                ig_mat = mathutils.Matrix.Identity(4)
             ig_t, ig_r, ig_s = ig_mat.decompose()
             
             bs.write_vec3(ig_t * scale)

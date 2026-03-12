@@ -356,7 +356,10 @@ def apply_anm(anm, armature_obj, frame_offset=0, flip=False):
     for pbone in armature_obj.pose.bones:
         v_global = pbone.bone.matrix_local
         n_global = native_global_rest[pbone.name]
-        corrections[pbone.name] = n_global.inverted() @ v_global
+        try:
+            corrections[pbone.name] = n_global.inverted() @ v_global
+        except ValueError:
+            corrections[pbone.name] = mathutils.Matrix.Identity(4)
 
     # --- 3. Collect all keyframe data (first pass) ---
     tracks_dict = {t.joint_hash: t for t in anm.tracks}
@@ -382,16 +385,25 @@ def apply_anm(anm, armature_obj, frame_offset=0, flip=False):
         else:
             C_parent = mathutils.Matrix.Identity(4)
 
-        C_parent_inv = C_parent.inverted()
+        try:
+            C_parent_inv = C_parent.inverted()
+        except ValueError:
+            C_parent_inv = mathutils.Matrix.Identity(4)
 
         # Get rest visual local matrix (computed once per bone)
         if pbone.parent:
             rest_v_parent = pbone.parent.bone.matrix_local
             rest_v_child = pbone.bone.matrix_local
-            rest_v_local = rest_v_parent.inverted() @ rest_v_child
+            try:
+                rest_v_local = rest_v_parent.inverted() @ rest_v_child
+            except ValueError:
+                rest_v_local = rest_v_child
         else:
             rest_v_local = pbone.bone.matrix_local
-        rest_v_local_inv = rest_v_local.inverted()
+        try:
+            rest_v_local_inv = rest_v_local.inverted()
+        except ValueError:
+            rest_v_local_inv = mathutils.Matrix.Identity(4)
 
         # Fallback values (native bind pose)
         nb_t = pbone.get("native_bind_t")

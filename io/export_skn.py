@@ -202,8 +202,18 @@ def write_skn_multi(filepath, mesh_objects, armature_obj, clean_names=True, disa
     if not armature_obj:
         raise Exception("No armature found")
 
-    # Sort bones to ensure stable indexing matching SKL
-    bone_list = list(armature_obj.pose.bones)
+    # Sort bones by original import order (native bones first, new bones appended)
+    # This MUST match export_skl.py ordering for consistent influence indices
+    native_bones = []
+    new_bones = []
+    for b in armature_obj.pose.bones:
+        idx = b.get("native_bone_index")
+        if idx is not None:
+            native_bones.append((int(idx), b))
+        else:
+            new_bones.append(b)
+    native_bones.sort(key=lambda x: x[0])
+    bone_list = [b for _, b in native_bones] + new_bones
     # Build bone name to index map, with cleaned names if option enabled
     bone_to_idx = {}
     for i, bone in enumerate(bone_list):

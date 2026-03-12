@@ -215,6 +215,8 @@ def create_armature(joints, name="Armature"):
         pbone["native_bind_t"] = [joint.raw_trans.x * IMPORT_SCALE, joint.raw_trans.y * IMPORT_SCALE, joint.raw_trans.z * IMPORT_SCALE]
         pbone["native_bind_r"] = [joint.raw_rot.w, joint.raw_rot.x, joint.raw_rot.y, joint.raw_rot.z]
         pbone["native_bind_s"] = [joint.raw_scale.x, joint.raw_scale.y, joint.raw_scale.z]
+        # Store original bone index for stable export ordering
+        pbone["native_bone_index"] = i
 
     return armature_obj
 
