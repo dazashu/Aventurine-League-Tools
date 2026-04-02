@@ -26,7 +26,7 @@ from .utils import history
 from .io import texture_ops
 from .io import file_handlers
 from .tools import smart_weights
-# Note: retarget and physics are now under .extras and loaded conditionally
+# Note: retarget, physics, and boobs_physics are now under .extras and loaded conditionally
 
 def update_physics(self, context):
     try:
@@ -58,8 +58,18 @@ def update_anim_loader(self, context):
     except Exception as e:
         print(f"Error toggling anim loader: {e}")
 
+def update_boobs_physics(self, context):
+    try:
+        from .extras import boobs_physics
+        if self.enable_boobs_physics:
+            boobs_physics.register()
+        else:
+            boobs_physics.unregister()
+    except Exception as e:
+        print(f"Error toggling boobs physics: {e}")
+
 def update_animation_tools(self, context):
-    """Master toggle for Misc LoL Tools - enables/disables physics, retarget, anim loader, and skin tools"""
+    """Master toggle for Misc LoL Tools - enables/disables physics, retarget, anim loader, skin tools, and boobs physics"""
     try:
         if self.enable_animation_tools:
             # Enable all sub-panels
@@ -67,12 +77,14 @@ def update_animation_tools(self, context):
             self.enable_retarget = True
             self.enable_anim_loader = True
             self.enable_skin_tools = True
+            self.enable_boobs_physics = True
         else:
             # Disable all sub-panels
             self.enable_physics = False
             self.enable_retarget = False
             self.enable_anim_loader = False
             self.enable_skin_tools = False
+            self.enable_boobs_physics = False
     except Exception as e:
         print(f"Error toggling animation tools: {e}")
 
@@ -126,6 +138,13 @@ class LolAddonPreferences(bpy.types.AddonPreferences):
         description="Enable the skin tools panel for automatic weight painting",
         default=True,
         update=update_skin_tools
+    )
+
+    enable_boobs_physics: BoolProperty(
+        name="Auto Boobs Physics",
+        description="Enable the Auto Physics panel for automated breast jiggle physics",
+        default=True,
+        update=update_boobs_physics
     )
 
     direct_drag_drop: BoolProperty(
@@ -241,6 +260,7 @@ class LolAddonPreferences(bpy.types.AddonPreferences):
         sub.prop(self, "enable_physics")
         sub.prop(self, "enable_retarget")
         sub.prop(self, "enable_anim_loader")
+        sub.prop(self, "enable_boobs_physics")
 
         # Drag & Drop Setting
         box.prop(self, "direct_drag_drop")
@@ -997,6 +1017,13 @@ def register():
                 anim_loader.register()
             except Exception as e:
                 print(f"Failed to auto-load anim loader: {e}")
+
+        if prefs.enable_boobs_physics:
+            try:
+                from .extras import boobs_physics
+                boobs_physics.register()
+            except Exception as e:
+                print(f"Failed to auto-load boobs physics: {e}")
     except:
         pass
 
@@ -1016,6 +1043,11 @@ def unregister():
     try:
         from .extras import anim_loader
         anim_loader.unregister()
+    except: pass
+
+    try:
+        from .extras import boobs_physics
+        boobs_physics.unregister()
     except: pass
 
     # Unregister file handlers for drag-and-drop
