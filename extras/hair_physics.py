@@ -192,7 +192,7 @@ def _bake_hair(context, arm, bone_names, intensity):
     from .boobs_physics import (
         _detect_animation_loops,
         _smooth_boundary_frames,
-        _seamless_blend_physics_loop,
+        _force_loop_perfect_match,
         _restore_nonloop_start_to_tpose,
         _clean_tpose_keyframes,
     )
@@ -225,9 +225,12 @@ def _bake_hair(context, arm, bone_names, intensity):
 
     preroll_cycles = 3 if is_loop else 1
     scene.wiggle.is_preroll = True
-    for _ in range(preroll_cycles):
-        for f in range(frame_start, frame_end + 1):
+    
+    for _cycle in range(preroll_cycles):
+        eval_end = frame_end - 1 if is_loop and frame_end > frame_start else frame_end
+        for f in range(frame_start, eval_end + 1):
             scene.frame_set(f)
+            
     scene.wiggle.is_preroll = False
 
     bpy.ops.wiggle.select()
@@ -243,8 +246,7 @@ def _bake_hair(context, arm, bone_names, intensity):
     action = arm.animation_data.action
     if action:
         if is_loop:
-            _smooth_boundary_frames(action, frame_start, frame_end, bone_names, smooth_ends='both')
-            _seamless_blend_physics_loop(action, frame_start, frame_end, bone_names)
+            _force_loop_perfect_match(action, frame_start, frame_end, bone_names)
         else:
             _restore_nonloop_start_to_tpose(action, frame_start, bone_names)
             _smooth_boundary_frames(action, frame_start, frame_end, bone_names, smooth_ends='start')
@@ -569,6 +571,10 @@ class HAIR_OT_ApplyToAll(Operator):
         if not armature_obj.animation_data:
             armature_obj.animation_data_create()
 
+        # SPEED OPTIMIZATION: Disable global undo to prevent RAM throttling!
+        user_undo = context.preferences.edit.use_global_undo
+        context.preferences.edit.use_global_undo = False
+
         original_action = armature_obj.animation_data.action
 
         total = len(props.animations)
@@ -576,6 +582,18 @@ class HAIR_OT_ApplyToAll(Operator):
         fail_count = 0
         fps = context.scene.render.fps
 
+        # SPEED OPTIMIZATION: Hide all meshes and disable their armature modifiers
+        disabled_armature_mods = []
+        hidden_meshes = []
+        for obj in context.scene.objects:
+            if obj.type == 'MESH':
+                for mod in obj.modifiers:
+                    if mod.type == 'ARMATURE' and mod.show_viewport:
+                        mod.show_viewport = False
+                        disabled_armature_mods.append(mod)
+                if not obj.hide_viewport:
+                    obj.hide_viewport = True
+                    hidden_meshes.append(obj)
         _apply_wiggle(context, armature_obj, bone_names, props.jiggle_intensity)
 
         for idx, anim_item in enumerate(props.animations):
@@ -625,6 +643,13 @@ class HAIR_OT_ApplyToAll(Operator):
 
         armature_obj.wiggle_freeze = False
         _ensure_object_mode(context)
+
+        # SPEED OPTIMIZATION: Restore meshes
+        for mod in disabled_armature_mods:
+            mod.show_viewport = True
+        for obj in hidden_meshes:
+            obj.hide_viewport = False
+            
         props.status_text = "Ready"
 
         if fail_count > 0:
@@ -632,6 +657,7 @@ class HAIR_OT_ApplyToAll(Operator):
         else:
             self.report({'INFO'}, f"Done: {success_count} animations exported to {export_dir}")
 
+        context.preferences.edit.use_global_undo = user_undo
         return {'FINISHED'}
 
 

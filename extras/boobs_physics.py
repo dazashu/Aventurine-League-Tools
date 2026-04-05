@@ -325,42 +325,59 @@ def clear_wiggle_from_bones(context, armature_obj, bone_names):
 
 
 def _detect_animation_loops(action, frame_start, frame_end):
-    """Detect whether an animation loops by comparing f-curve values at
-    the first and last frames. Non-looping animations (death, spawn, etc.)
-    have drastically different poses at start vs end.
-
-    Uses MAX diff rather than average. A LoL armature has 100+ bones —
-    most are finger/face/secondary bones that barely move in any animation.
-    Averaging them together drowns out the 5–10 dramatic body bones that
-    actually signal a non-loop (e.g. pelvis Z dropping 0.9m in a death
-    animation). Max diff catches any single channel that changes
-    significantly and correctly identifies it as non-looping.
+    """Detect whether an animation loops by strictly checking if the first 
+    frame equals the last frame. Resolves Quaternion alias bugs where q and -q 
+    are mathematically different in F-Curves but visually identical.
     """
-    max_diff = 0.0
+    bone_states_start = {}
+    bone_states_end = {}
     has_data = False
 
     for fcurve in action.fcurves:
         dp = fcurve.data_path
         if 'pose.bones["' not in dp:
             continue
-        # Only look at location and rotation channels for detection
-        if not any(p in dp for p in ['location', 'rotation']):
-            continue
+            
         val_s = fcurve.evaluate(frame_start)
         val_e = fcurve.evaluate(frame_end)
-        diff = abs(val_e - val_s)
-        if diff > max_diff:
-            max_diff = diff
-        has_data = True
+        idx = fcurve.array_index
+        
+        if dp not in bone_states_start:
+            bone_states_start[dp] = [0.0, 0.0, 0.0, 1.0]
+            bone_states_end[dp]   = [0.0, 0.0, 0.0, 1.0]
+            
+        if idx < 4:
+            bone_states_start[dp][idx] = val_s
+            bone_states_end[dp][idx] = val_e
+            has_data = True
 
     if not has_data:
-        return True  # assume looping if we can't tell
+        return True
+        
+    max_diff = 0.0
+    for dp, vs in bone_states_start.items():
+        ve = bone_states_end[dp]
+        
+        if 'rotation_quaternion' in dp:
+            # Safe dot product comparison (ignores q vs -q visual aliasing)
+            import math
+            mag_s = math.sqrt(sum(v*v for v in vs))
+            mag_e = math.sqrt(sum(v*v for v in ve))
+            
+            if mag_s > 0.001 and mag_e > 0.001:
+                dot = sum((vs[i]/mag_s) * (ve[i]/mag_e) for i in range(4))
+                diff = 1.0 - abs(dot)
+            else:
+                diff = max(abs(vs[i]-ve[i]) for i in range(4))
+        else:
+            diff = max(abs(vs[i]-ve[i]) for i in range(3))
+            
+        if diff > max_diff:
+            max_diff = diff
 
-    # Threshold 0.15: a quaternion component changes by ~0.15 for roughly
-    # a 17° rotation; a location channel changes by 0.15 Blender units.
-    # Either is solidly detectable as a non-loop. Idle/walk loops will
-    # typically have max_diff < 0.05; death/spawn/recall will be >> 0.15.
-    return max_diff < 0.15
+    # If the maximum deviation across any channel/bone is less than 0.1,
+    # the first frame visually perfectly matches the last frame = loop.
+    return max_diff < 0.1
 
 
 def bake_wiggle_for_current_action(context, armature_obj, bone_names, intensity):
@@ -417,13 +434,17 @@ def bake_wiggle_for_current_action(context, armature_obj, bone_names, intensity)
 
     # --- Step 2: Forward preroll ---
     # Looping anims: cycle 3× so physics reaches steady-state for seamless loop
-    # Non-looping anims: single forward pass — physics starts from rest which
-    # is correct (character starts in a neutral standing pose)
+    # For loops, frame_end is typically a duplicate of frame_start. If we feed both 
+    # to Wiggle consecutively, it reads 0 motion and stalls the momentum for 1 frame.
+    # By stopping at frame_end - 1 and wrapping to frame_start, momentum is unbroken.
     preroll_cycles = 3 if is_loop else 1
     scene.wiggle.is_preroll = True
+    
     for _cycle in range(preroll_cycles):
-        for f in range(frame_start, frame_end + 1):
+        eval_end = frame_end - 1 if is_loop and frame_end > frame_start else frame_end
+        for f in range(frame_start, eval_end + 1):
             scene.frame_set(f)
+            
     scene.wiggle.is_preroll = False
 
     # --- Step 3: Select wiggle bones for baking ---
@@ -446,9 +467,10 @@ def bake_wiggle_for_current_action(context, armature_obj, bone_names, intensity)
     action = armature_obj.animation_data.action
     if action:
         if is_loop:
-            # Looping: smooth both boundary ends, then blend last frames into first
-            _smooth_boundary_frames(action, frame_start, frame_end, bone_names, smooth_ends='both')
-            _seamless_blend_physics_loop(action, frame_start, frame_end, bone_names)
+            # Looping: Wiggle's 3x preroll naturally syncs the physics momentum.
+            # We strictly enforce numerical identity on the last frame, but we DO NOT 
+            # smooth any other boundary frames, as that dampens the velocity.
+            _force_loop_perfect_match(action, frame_start, frame_end, bone_names)
         else:
             # Non-looping (death, spawn, etc.):
             # Step A — overwrite frame 1 with T-pose identity so physics has a
@@ -577,15 +599,13 @@ def _smooth_boundary_frames(action, frame_start, frame_end, bone_names,
         fcurve.update()
 
 
-def _seamless_blend_physics_loop(action, frame_start, frame_end, bone_names):
-    """Smoothly blend the last few baked frames toward frame 1 values for a
-    perfect animation loop. Uses a gradual blend instead of a hard copy so
-    there's no visible pop at the loop boundary.
+def _force_loop_perfect_match(action, frame_start, frame_end, bone_names):
+    """For perfect loops, Wiggle's 3x preroll naturally syncs the physics.
+    We just need to ensure the very last frame is exactly numerically identical 
+    to the first frame so the engine doesn't stutter, without destroying the
+    mid-frame momentum by blending.
     """
     bone_set = set(b for b in bone_names if b)
-    duration = frame_end - frame_start
-    # Blend zone = ~8% of the animation, minimum 2 frames, maximum 6
-    blend_count = max(2, min(6, int(duration * 0.08)))
 
     for fcurve in action.fcurves:
         dp = fcurve.data_path
@@ -598,24 +618,15 @@ def _seamless_blend_physics_loop(action, frame_start, frame_end, bone_names):
         if bname not in bone_set:
             continue
 
-        # Collect keyframe values by frame number
         kf_map = {int(kp.co[0]): kp for kp in fcurve.keyframe_points}
 
         first_kp = kf_map.get(frame_start)
         if first_kp is None:
             continue
+            
         target_val = first_kp.co[1]
 
-        # Blend the last blend_count frames toward the target value
-        for i in range(1, blend_count + 1):
-            f = frame_end - blend_count + i
-            kp = kf_map.get(f)
-            if kp is None:
-                continue
-            t = i / float(blend_count)
-            kp.co[1] = kp.co[1] * (1.0 - t) + target_val * t
-
-        # Ensure exact match on the very last frame
+        # Guarantee the last frame matches the first frame. No blending required.
         last_kp = kf_map.get(frame_end)
         if last_kp:
             last_kp.co[1] = target_val
@@ -1100,6 +1111,10 @@ class BOOBS_OT_ApplyToAll(Operator):
         if not armature_obj.animation_data:
             armature_obj.animation_data_create()
 
+        # SPEED OPTIMIZATION: Disable global undo to prevent RAM throttling!
+        user_undo = context.preferences.edit.use_global_undo
+        context.preferences.edit.use_global_undo = False
+        
         # Store original action
         original_action = armature_obj.animation_data.action
 
@@ -1109,6 +1124,22 @@ class BOOBS_OT_ApplyToAll(Operator):
         fps = context.scene.render.fps
 
         # Configure wiggle on breast bones ONCE (properties persist on PoseBone)
+        apply_wiggle_to_bones(context, armature_obj, bone_names, props.jiggle_intensity)
+
+        # SPEED OPTIMIZATION: Hide all meshes and disable their armature modifiers
+        # This stops Blender from recalculating thousands of vertices per frame
+        # during the physics preroll and bake stages, cutting processing time immensely.
+        disabled_armature_mods = []
+        hidden_meshes = []
+        for obj in context.scene.objects:
+            if obj.type == 'MESH':
+                for mod in obj.modifiers:
+                    if mod.type == 'ARMATURE' and mod.show_viewport:
+                        mod.show_viewport = False
+                        disabled_armature_mods.append(mod)
+                if not obj.hide_viewport:
+                    obj.hide_viewport = True
+                    hidden_meshes.append(obj)
         apply_wiggle_to_bones(context, armature_obj, bone_names, props.jiggle_intensity)
 
         for idx, anim_item in enumerate(props.animations):
@@ -1173,6 +1204,13 @@ class BOOBS_OT_ApplyToAll(Operator):
 
         armature_obj.wiggle_freeze = False
         ensure_object_mode(context)
+
+        # SPEED OPTIMIZATION: Restore meshes
+        for mod in disabled_armature_mods:
+            mod.show_viewport = True
+        for obj in hidden_meshes:
+            obj.hide_viewport = False
+
         props.status_text = "Ready"
 
         if fail_count > 0:
@@ -1180,6 +1218,7 @@ class BOOBS_OT_ApplyToAll(Operator):
         else:
             self.report({'INFO'}, f"Done: {success_count} animations exported to {export_dir}")
 
+        context.preferences.edit.use_global_undo = user_undo
         return {'FINISHED'}
 
 

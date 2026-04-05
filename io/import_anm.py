@@ -541,30 +541,28 @@ def apply_anm(anm, armature_obj, frame_offset=0, flip=False):
                 continue
 
             if use_fast_path and fcurves_collection is not None:
-                # Fast path: Create FCurve with first keyframe, then batch insert
-                first_frame = sorted_frames[0]
-                first_value = frames_dict[first_frame]
-
-                setattr(pbone, prop_name, first_value)
-                pbone.keyframe_insert(data_path=prop_name, frame=first_frame)
-                total_keyframes += num_channels
-
-                # Get the FCurves that were just created
+                # ULTRA-FAST PATH: C-level memory copying via foreach_set
                 data_path = f'pose.bones["{bone_name}"].{prop_name}'
-                fcurves = [fcurves_collection.find(data_path, index=i) for i in range(num_channels)]
-
-                # Remaining frames: insert directly to FCurves (much faster)
-                for frame in sorted_frames[1:]:
-                    value = frames_dict[frame]
-                    for i, fc in enumerate(fcurves):
-                        if fc:
-                            fc.keyframe_points.insert(float(frame), float(value[i]), options={'FAST'})
-                            total_keyframes += 1
-
-                # Update FCurves to recalculate handles
-                for fc in fcurves:
-                    if fc:
-                        fc.update()
+                
+                for i in range(num_channels):
+                    fc = fcurves_collection.find(data_path, index=i)
+                    if not fc:
+                        fc = fcurves_collection.new(data_path, index=i, action_group=bone_name)
+                        
+                    # Allocate all points instantaneously
+                    fc.keyframe_points.add(len(sorted_frames))
+                    
+                    # Interleave frame numbers and values into a flat float array
+                    coords = [0.0] * (len(sorted_frames) * 2)
+                    for k, frame in enumerate(sorted_frames):
+                        coords[k*2] = float(frame)
+                        coords[k*2 + 1] = float(frames_dict[frame][i])
+                        
+                    # Inject into C memory directly
+                    fc.keyframe_points.foreach_set('co', coords)
+                    fc.update()
+                    
+                    total_keyframes += len(sorted_frames)
             else:
                 # Slow path for Blender 5.0+: use keyframe_insert for all frames
                 for frame in sorted_frames:
