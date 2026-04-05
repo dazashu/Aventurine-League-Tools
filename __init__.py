@@ -68,6 +68,16 @@ def update_boobs_physics(self, context):
     except Exception as e:
         print(f"Error toggling boobs physics: {e}")
 
+def update_hair_physics(self, context):
+    try:
+        from .extras import hair_physics
+        if self.enable_hair_physics:
+            hair_physics.register()
+        else:
+            hair_physics.unregister()
+    except Exception as e:
+        print(f"Error toggling hair physics: {e}")
+
 def update_animation_tools(self, context):
     """Master toggle for Misc LoL Tools - enables/disables physics, retarget, anim loader, skin tools, and boobs physics"""
     try:
@@ -78,6 +88,7 @@ def update_animation_tools(self, context):
             self.enable_anim_loader = True
             self.enable_skin_tools = True
             self.enable_boobs_physics = True
+            self.enable_hair_physics = True
         else:
             # Disable all sub-panels
             self.enable_physics = False
@@ -85,6 +96,7 @@ def update_animation_tools(self, context):
             self.enable_anim_loader = False
             self.enable_skin_tools = False
             self.enable_boobs_physics = False
+            self.enable_hair_physics = False
     except Exception as e:
         print(f"Error toggling animation tools: {e}")
 
@@ -145,6 +157,13 @@ class LolAddonPreferences(bpy.types.AddonPreferences):
         description="Enable the Auto Physics panel for automated breast jiggle physics",
         default=True,
         update=update_boobs_physics
+    )
+
+    enable_hair_physics: BoolProperty(
+        name="Auto Hair Physics",
+        description="Enable the Auto Physics panel for automated hair jiggle physics",
+        default=True,
+        update=update_hair_physics
     )
 
     direct_drag_drop: BoolProperty(
@@ -261,6 +280,7 @@ class LolAddonPreferences(bpy.types.AddonPreferences):
         sub.prop(self, "enable_retarget")
         sub.prop(self, "enable_anim_loader")
         sub.prop(self, "enable_boobs_physics")
+        sub.prop(self, "enable_hair_physics")
 
         # Drag & Drop Setting
         box.prop(self, "direct_drag_drop")
@@ -1024,6 +1044,13 @@ def register():
                 boobs_physics.register()
             except Exception as e:
                 print(f"Failed to auto-load boobs physics: {e}")
+
+        if prefs.enable_hair_physics:
+            try:
+                from .extras import hair_physics
+                hair_physics.register()
+            except Exception as e:
+                print(f"Failed to auto-load hair physics: {e}")
     except:
         pass
 
@@ -1048,6 +1075,11 @@ def unregister():
     try:
         from .extras import boobs_physics
         boobs_physics.unregister()
+    except: pass
+
+    try:
+        from .extras import hair_physics
+        hair_physics.unregister()
     except: pass
 
     # Unregister file handlers for drag-and-drop
