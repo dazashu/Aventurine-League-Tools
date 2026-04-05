@@ -1229,31 +1229,18 @@ class BOOBS_UL_AnimList(UIList):
 #  Panel
 # ---------------------------------------------------------------------------
 
-class BOOBS_PT_MainPanel(Panel):
-    """Auto Physics panel in the 3D viewport sidebar"""
-    bl_label = "Auto Physics"
-    bl_idname = "VIEW3D_PT_auto_physics"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = 'Auto Physics'
-
-    def draw_header(self, context):
-        layout = self.layout
-        layout.label(text="", icon_value=icons.get_icon("icon_52"))
-
-    def draw(self, context):
-        layout = self.layout
-        layout.label(text="Select a sub-panel below.", icon='INFO')
-
-
 class BOOBS_PT_BoobsPhysics(Panel):
-    """Boobs Physics sub-panel"""
+    """Boobs Physics panel"""
     bl_label = "Boobs Physics"
     bl_idname = "VIEW3D_PT_boobs_physics"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = 'Auto Physics'
-    bl_parent_id = "VIEW3D_PT_auto_physics"
+    bl_category = 'Misc LoL Tools'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw_header(self, context):
+        layout = self.layout
+        layout.label(text="", icon_value=icons.get_icon("icon_52"))
 
     def draw(self, context):
         layout = self.layout
@@ -1413,7 +1400,6 @@ classes = [
     BOOBS_OT_LoadAnimation,
     BOOBS_OT_ApplyToAll,
     BOOBS_UL_AnimList,
-    BOOBS_PT_MainPanel,
     BOOBS_PT_BoobsPhysics,
 ]
 

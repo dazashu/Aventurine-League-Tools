@@ -686,8 +686,12 @@ class HAIR_PT_Physics(Panel):
     bl_idname     = "VIEW3D_PT_hair_physics"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category   = 'Auto Physics'
-    bl_parent_id  = "VIEW3D_PT_auto_physics"
+    bl_category   = 'Misc LoL Tools'
+    bl_options    = {'DEFAULT_CLOSED'}
+
+    def draw_header(self, context):
+        layout = self.layout
+        layout.label(text="", icon_value=icons.get_icon("icon_52"))
 
     def draw(self, context):
         layout = self.layout
