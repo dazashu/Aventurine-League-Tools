@@ -6,15 +6,31 @@ then bakes the result into animation keyframes for in-game use.
 
 import bpy
 import os
-import math
 from bpy.types import Panel, Operator, PropertyGroup, UIList
 from bpy.props import (
     StringProperty, CollectionProperty, IntProperty,
-    PointerProperty, FloatProperty, BoolProperty, EnumProperty
+    PointerProperty, FloatProperty, BoolProperty,
 )
 from ..ui import icons
 from ..io import import_anm
 from ..io import export_anm
+from .physics_common import (
+    lerp, lerp_exp,
+    find_armature, get_animations_folder,
+    ensure_object_mode, select_armature,
+    configure_wiggle_bones, clear_wiggle_from_bones, strip_physics_keyframes,
+    find_default_collision_bones, post_bake_collision_correct,
+    precompute_collision_radii, hide_meshes_for_batch, restore_meshes_after_batch,
+)
+from .wiggle_bake_common import (
+    _detect_animation_loops,
+    _force_loop_perfect_match,
+    _restore_nonloop_start_to_tpose,
+    _smooth_boundary_frames,
+    _velocity_match_loop,
+    _set_linear_interpolation,
+    _clean_tpose_keyframes,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -27,7 +43,7 @@ from ..io import export_anm
 def get_jiggle_params(intensity):
     """Map a 1-20 intensity slider to Wiggle 2 bone physics parameters.
 
-    Returns dict with: stiff, damp, gravity, mass, stretch, chain
+    Returns dict with: stiff, damp, gravity, mass, stretch, chain.
 
     Uses exponential interpolation so every slider notch produces a
     perceptually distinct change. Floor values on stiff and damp are
@@ -36,63 +52,36 @@ def get_jiggle_params(intensity):
       stiff floor 55: spring always has enough restoring force to pull
         the bone back before velocity can accumulate infinitely.
       damp floor 0.25: at 24fps (dt=0.042), effective per-frame factor =
-        1 - 0.25*0.042 = 0.9895 -- still very bouncy but the oscillation
+        1 - 0.25*0.042 = 0.9895 — still very bouncy but oscillation
         decays rather than growing. Below this the sim becomes chaotic.
 
     stretch is intentionally near-zero. Bone stretching looks distorted
     for breast bones; jiggle should come purely from rotation.
     """
     t = max(0.0, min(1.0, (intensity - 1) / 19.0))  # 0..1 linear
-    t = t * t  # quadratic bias: makes slider 10 feel like old slider 5
-
-    # Stiffness: high = snap-back fast (subtle), low = floaty (jiggle).
-    # Floor at 55 so the spring never becomes too weak to prevent runaway.
-    stiff = lerp_exp(580.0, 55.0, t)
-
-    # Damping: high = oscillation dies quickly, low = sustained bouncing.
-    # Floor at 0.25 prevents chaotic underdamped behaviour at high intensity.
-    damp = lerp_exp(10.0, 0.25, t)
-
-    # Gravity: absolute minimum. Any noticeable gravity makes them droop.
-    gravity = lerp(0.0, 0.03, t)
-
-    # Mass: heavier at high intensity for natural momentum/follow-through.
-    mass = lerp_exp(0.3, 1.8, t)
-
-    # Stretch: intentionally tiny - bone stretching looks distorted.
-    stretch = lerp(0.0, 0.02, t)
+    t = t * t                                         # quadratic bias: slider 10 ≈ old slider 5
 
     return {
-        'stiff': stiff,
-        'damp': damp,
-        'gravity': gravity,
-        'mass': mass,
-        'stretch': stretch,
-        'chain': True,
+        'stiff':   lerp_exp(580.0, 55.0, t),   # high = snap-back, low = floaty
+        'damp':    lerp_exp(10.0, 0.25, t),    # high = dies fast, low = sustained bounce
+        'gravity': lerp(0.0, 0.03, t),         # near-zero — any more makes them droop
+        'mass':    lerp_exp(0.3, 1.8, t),      # heavier at high intensity for momentum
+        'stretch': lerp(0.0, 0.02, t),         # tiny — stretching looks distorted
+        'chain':   True,
     }
 
 
-def lerp(a, b, t):
-    return a + (b - a) * t
-
-
-def lerp_exp(a, b, t):
-    """Exponential (log-space) interpolation between a and b.
-    Both a and b must be positive. Produces perceptually uniform steps
-    unlike linear interpolation when the values span multiple orders of
-    magnitude (e.g. damping 12 → 0.08).
-    """
-    import math
-    return math.exp(math.log(a) + (math.log(b) - math.log(a)) * t)
+def apply_wiggle_to_bones(context, armature_obj, bone_names, intensity):
+    """Configure Wiggle 2 on breast bones with intensity-mapped parameters."""
+    return configure_wiggle_bones(context, armature_obj, bone_names, get_jiggle_params(intensity))
 
 
 # ---------------------------------------------------------------------------
-#  Property group for animation list items (reused pattern from anim_loader)
+#  Property group for animation list items
 # ---------------------------------------------------------------------------
 
 class BoobsAnimListItem(PropertyGroup):
-    """Single animation file entry"""
-    name: StringProperty(name="Animation Name")
+    name:     StringProperty(name="Animation Name")
     filepath: StringProperty(name="File Path")
 
 
@@ -103,11 +92,10 @@ def update_search_filter(self, context):
 
 
 # ---------------------------------------------------------------------------
-#  Main properties stored on the Scene
+#  Scene properties
 # ---------------------------------------------------------------------------
 
 class BoobsPhysicsProperties(PropertyGroup):
-    # Bone names (user picks from armature)
     breast_bone_L: StringProperty(
         name="Left Breast Bone",
         description="Name of the left breast bone in the armature",
@@ -122,20 +110,17 @@ class BoobsPhysicsProperties(PropertyGroup):
     jiggle_intensity: IntProperty(
         name="Jiggle Intensity",
         description="1 = barely any jiggle, 10 = natural, 20 = exaggerated bounce",
-        default=10,
-        min=1,
-        max=20
+        default=10, min=1, max=20
     )
 
     # Animation folder browser
-    animations: CollectionProperty(type=BoobsAnimListItem)
-    active_index: IntProperty(default=0)
+    animations:        CollectionProperty(type=BoobsAnimListItem)
+    active_index:      IntProperty(default=0)
     animations_folder: StringProperty(name="Animations Folder", default="")
-    custom_folder: StringProperty(
+    custom_folder:     StringProperty(
         name="Custom Folder",
         description="Manually selected animations folder",
-        default="",
-        subtype='DIR_PATH'
+        default="", subtype='DIR_PATH'
     )
     search_filter: StringProperty(
         name="Search",
@@ -144,563 +129,136 @@ class BoobsPhysicsProperties(PropertyGroup):
         update=update_search_filter,
         options={'TEXTEDIT_UPDATE'}
     )
-    status_text: StringProperty(default="Ready")
+    status_text:    StringProperty(default="Ready")
     current_loaded: StringProperty(name="Currently Loaded", default="")
 
-    # Export folder
+    # Export
     export_folder: StringProperty(
         name="Export Folder",
         description="Folder to export baked animations",
-        default="",
-        subtype='DIR_PATH'
+        default="", subtype='DIR_PATH'
     )
 
-    # Processing flags
-    is_processing: BoolProperty(default=False)
-
-    # Snapshot action name for Undo Preview (stores pre-bake copy)
+    is_processing:      BoolProperty(default=False)
     backup_action_name: StringProperty(default="")
 
+    # Body collision
+    collision_enabled: BoolProperty(
+        name="Body Collision",
+        description="Create invisible proxy spheres on arm/shoulder bones so jiggle "
+                    "bones bounce off them instead of clipping through",
+        default=False
+    )
+    collision_bones: StringProperty(
+        name="Collision Bones",
+        description="Comma-separated list of body bones to use as colliders "
+                    "(auto-detect fills this for you)",
+        default=""
+    )
+    collision_sphere_factor: FloatProperty(
+        name="Radius Scale",
+        description="Overall scale for all collision capsule radii. "
+                    "1.0 = auto-sized per bone type.",
+        default=1.0, min=0.05, max=3.0, step=5, precision=2,
+    )
+
+    # Breast self-collision
+    boob_self_collision: BoolProperty(
+        name="Boobs Collision",
+        description="Prevent the breast bones from clipping through each other",
+        default=False
+    )
+    boob_self_collision_scale: FloatProperty(
+        name="Radius Scale",
+        description="How far apart the breast bones are kept. "
+                    "1.0 = default separation.",
+        default=1.0, min=0.1, max=3.0, step=5, precision=2,
+    )
+
 
 # ---------------------------------------------------------------------------
-#  Utility helpers
+#  Bake pipeline
 # ---------------------------------------------------------------------------
-
-def find_armature(context):
-    """Find the best armature in the scene."""
-    if context.active_object and context.active_object.type == 'ARMATURE':
-        arm = context.active_object
-        if arm.get("lol_skl_filepath") or arm.get("lol_skn_filepath"):
-            return arm
-
-    for obj in context.scene.objects:
-        if obj.type == 'ARMATURE':
-            if obj.get("lol_skl_filepath") or obj.get("lol_skn_filepath"):
-                return obj
-
-    for obj in context.scene.objects:
-        if obj.type == 'ARMATURE':
-            return obj
-
-    return None
-
-
-def get_animations_folder(armature_obj):
-    """Get the animations folder path based on the armature's SKL filepath."""
-    if not armature_obj:
-        return None
-    skl_path = armature_obj.get("lol_skl_filepath")
-    if not skl_path:
-        skn_path = armature_obj.get("lol_skn_filepath")
-        if skn_path:
-            skl_path = skn_path
-    if not skl_path:
-        return None
-    parent_folder = os.path.dirname(skl_path)
-    animations_folder = os.path.join(parent_folder, "animations")
-    if os.path.isdir(animations_folder):
-        return animations_folder
-    return None
-
-
-def ensure_object_mode(context):
-    """Safely switch to object mode."""
-    try:
-        if context.active_object and context.mode != 'OBJECT':
-            bpy.ops.object.mode_set(mode='OBJECT')
-    except RuntimeError:
-        pass
-
-
-def select_armature(context, armature_obj):
-    """Select and activate an armature."""
-    ensure_object_mode(context)
-    bpy.ops.object.select_all(action='DESELECT')
-    armature_obj.select_set(True)
-    context.view_layer.objects.active = armature_obj
-
-
-def ensure_physics_registered():
-    """Make sure the Wiggle 2 physics engine is registered.
-    If not, register it automatically so wiggle properties exist.
-    """
-    if not hasattr(bpy.types.Scene, 'wiggle_enable'):
-        try:
-            from . import physics
-            physics.register()
-            print("Auto-registered Wiggle 2 physics for boobs_physics")
-        except Exception as e:
-            raise RuntimeError(
-                f"Cannot enable jiggle physics — Wiggle 2 failed to load: {e}\n"
-                "Make sure 'League Physics' is enabled in addon preferences."
-            )
-
-
-def apply_wiggle_to_bones(context, armature_obj, bone_names, intensity):
-    """Configure Wiggle 2 physics on the given bone names.
-    MUST be called with the armature active. Switches to pose mode internally
-    so that wiggle property update callbacks can access selected_pose_bones.
-    """
-    ensure_physics_registered()
-    params = get_jiggle_params(intensity)
-
-    # Switch to pose mode — wiggle update callbacks need selected_pose_bones
-    select_armature(context, armature_obj)
-    bpy.ops.object.mode_set(mode='POSE')
-
-    # Enable wiggle on scene and armature
-    context.scene.wiggle_enable = True
-    armature_obj.wiggle_enable = True
-    armature_obj.wiggle_mute = False
-    armature_obj.wiggle_freeze = False
-
-    configured = []
-    for bname in bone_names:
-        if not bname:
-            continue
-        pb = armature_obj.pose.bones.get(bname)
-        if not pb:
-            continue
-
-        # Select ONLY this bone so update callbacks iterate safely
-        bpy.ops.pose.select_all(action='DESELECT')
-        pb.bone.select = True
-        armature_obj.data.bones.active = pb.bone
-
-        # Enable tail wiggle on the breast bone
-        pb.wiggle_tail = True
-        pb.wiggle_head = False
-        pb.wiggle_mute = False
-        pb.wiggle_enable = True
-
-        # Apply jiggle parameters
-        pb.wiggle_stiff = params['stiff']
-        pb.wiggle_damp = params['damp']
-        pb.wiggle_gravity = params['gravity']
-        pb.wiggle_mass = params['mass']
-        pb.wiggle_stretch = params['stretch']
-        pb.wiggle_chain = params['chain']
-
-        configured.append(bname)
-
-    # Rebuild wiggle bone list so the engine picks them up
-    from . import physics
-    try:
-        physics.build_list()
-    except Exception:
-        pass
-
-    return configured
-
-
-def clear_wiggle_from_bones(context, armature_obj, bone_names):
-    """Remove wiggle settings from specified bones."""
-    ensure_physics_registered()
-
-    # Need pose mode for the update callbacks
-    select_armature(context, armature_obj)
-    bpy.ops.object.mode_set(mode='POSE')
-
-    for bname in bone_names:
-        if not bname:
-            continue
-        pb = armature_obj.pose.bones.get(bname)
-        if not pb:
-            continue
-
-        # Select the bone so update callbacks work
-        bpy.ops.pose.select_all(action='DESELECT')
-        pb.bone.select = True
-        armature_obj.data.bones.active = pb.bone
-
-        pb.wiggle_tail = False
-        pb.wiggle_head = False
-        pb.wiggle_enable = False
-
-    from . import physics
-    try:
-        physics.build_list()
-    except Exception:
-        pass
-
-
-def _detect_animation_loops(action, frame_start, frame_end):
-    """Detect whether an animation loops by strictly checking if the first 
-    frame equals the last frame. Resolves Quaternion alias bugs where q and -q 
-    are mathematically different in F-Curves but visually identical.
-    """
-    bone_states_start = {}
-    bone_states_end = {}
-    has_data = False
-
-    for fcurve in action.fcurves:
-        dp = fcurve.data_path
-        if 'pose.bones["' not in dp:
-            continue
-            
-        val_s = fcurve.evaluate(frame_start)
-        val_e = fcurve.evaluate(frame_end)
-        idx = fcurve.array_index
-        
-        if dp not in bone_states_start:
-            bone_states_start[dp] = [0.0, 0.0, 0.0, 1.0]
-            bone_states_end[dp]   = [0.0, 0.0, 0.0, 1.0]
-            
-        if idx < 4:
-            bone_states_start[dp][idx] = val_s
-            bone_states_end[dp][idx] = val_e
-            has_data = True
-
-    if not has_data:
-        return True
-        
-    max_diff = 0.0
-    for dp, vs in bone_states_start.items():
-        ve = bone_states_end[dp]
-        
-        if 'rotation_quaternion' in dp:
-            # Safe dot product comparison (ignores q vs -q visual aliasing)
-            import math
-            mag_s = math.sqrt(sum(v*v for v in vs))
-            mag_e = math.sqrt(sum(v*v for v in ve))
-            
-            if mag_s > 0.001 and mag_e > 0.001:
-                dot = sum((vs[i]/mag_s) * (ve[i]/mag_e) for i in range(4))
-                diff = 1.0 - abs(dot)
-            else:
-                diff = max(abs(vs[i]-ve[i]) for i in range(4))
-        else:
-            diff = max(abs(vs[i]-ve[i]) for i in range(3))
-            
-        if diff > max_diff:
-            max_diff = diff
-
-    # If the maximum deviation across any channel/bone is less than 0.1,
-    # the first frame visually perfectly matches the last frame = loop.
-    return max_diff < 0.1
-
 
 def bake_wiggle_for_current_action(context, armature_obj, bone_names, intensity):
     """Bake wiggle physics into the current action.
 
     Auto-detects whether the animation loops:
-    - Looping anims (idle, walk, dance): 3-cycle preroll + seamless blend
-    - Non-looping anims (death, spawn): 1-pass preroll, no blend
+    - Looping  (idle, walk, dance): 5-cycle preroll + velocity-matched seam.
+    - Non-loop (death, spawn):      1-cycle preroll + T-pose start restoration.
 
-    Always cleans up frame 0 (T-pose) so physics values never bleed into it.
+    Always cleans up frame 0 (T-pose) so physics values never bleed in.
     """
     scene = context.scene
 
     if not armature_obj.animation_data or not armature_obj.animation_data.action:
         return False, "No animation loaded on armature"
 
-    action = armature_obj.animation_data.action
+    action      = armature_obj.animation_data.action
     frame_start = max(1, int(action.frame_range[0]))
-    frame_end = int(action.frame_range[1])
+    frame_end   = int(action.frame_range[1])
 
     if frame_end <= frame_start:
         return False, "Animation has no frames"
 
-    # Frame 0 = bind/T-pose, frame 1 = first real animation frame
     scene.frame_start = 1
-    scene.frame_end = frame_end
+    scene.frame_end   = frame_end
 
-    # Detect loop BEFORE physics bake (uses raw animation keyframes)
     is_loop = _detect_animation_loops(action, frame_start, frame_end)
 
-    # Non-looping animations only get 1 preroll cycle (vs 3 for loops), so
-    # the physics never reaches a settled steady-state. At high intensities
-    # (low stiffness + low damping) this transient behaviour causes wild
-    # distortion that looks nothing like jiggle. Cap effective intensity at
-    # 13 for non-loop so the spring stays controlled during the single pass.
-    # Loops are completely unaffected by this cap.
     effective_intensity = intensity if is_loop else min(intensity, 13)
     if effective_intensity != intensity:
         apply_wiggle_to_bones(context, armature_obj, bone_names, effective_intensity)
 
-    # Must be in pose mode with the armature active
     select_armature(context, armature_obj)
     bpy.ops.object.mode_set(mode='POSE')
 
-    # Unfreeze (needed if previous bake froze it)
     armature_obj.wiggle_freeze = False
-
-    # loop=True prevents the wiggle handler from resetting physics at frame 1
-    scene.wiggle.loop = True
+    scene.wiggle.loop           = True
     scene.wiggle.bake_overwrite = True
 
-    # --- Step 1: Reset physics to clean state ---
+    # --- Step 1: Reset physics ---
     bpy.ops.wiggle.reset()
 
-    # --- Step 2: Forward preroll ---
-    # Looping anims: cycle 3× so physics reaches steady-state for seamless loop
-    # For loops, frame_end is typically a duplicate of frame_start. If we feed both 
-    # to Wiggle consecutively, it reads 0 motion and stalls the momentum for 1 frame.
-    # By stopping at frame_end - 1 and wrapping to frame_start, momentum is unbroken.
-    preroll_cycles = 3 if is_loop else 1
+    # --- Step 2: Preroll ---
+    preroll_cycles = 5 if is_loop else 1
     scene.wiggle.is_preroll = True
-    
+
     for _cycle in range(preroll_cycles):
-        eval_end = frame_end - 1 if is_loop and frame_end > frame_start else frame_end
-        for f in range(frame_start, eval_end + 1):
+        for f in range(frame_start, frame_end + 1):
             scene.frame_set(f)
-            
+
     scene.wiggle.is_preroll = False
 
-    # --- Step 3: Select wiggle bones for baking ---
+    # --- Step 3: Select wiggle bones and bake ---
     bpy.ops.wiggle.select()
 
-    # --- Step 4: Bake one full pass (keyframes are recorded) ---
     try:
         bpy.ops.nla.bake(
-            frame_start=frame_start,
-            frame_end=frame_end,
-            only_selected=True,
-            visual_keying=True,
-            use_current_action=True,
-            bake_types={'POSE'}
+            frame_start=frame_start, frame_end=frame_end,
+            only_selected=True, visual_keying=True,
+            use_current_action=True, bake_types={'POSE'}
         )
     except Exception as e:
-        return False, f"NLA bake failed: {str(e)}"
+        return False, f"NLA bake failed: {e}"
 
-    # --- Step 5: Post-bake cleanup ---
+    # --- Step 4: Post-bake cleanup ---
     action = armature_obj.animation_data.action
     if action:
         if is_loop:
-            # Looping: Wiggle's 3x preroll naturally syncs the physics momentum.
-            # We strictly enforce numerical identity on the last frame, but we DO NOT 
-            # smooth any other boundary frames, as that dampens the velocity.
-            _force_loop_perfect_match(action, frame_start, frame_end, bone_names)
+            _velocity_match_loop(action, frame_start, frame_end, bone_names)
         else:
-            # Non-looping (death, spawn, etc.):
-            # Step A — overwrite frame 1 with T-pose identity so physics has a
-            #           clean neutral starting point instead of whatever the
-            #           preroll left behind.
-            # Step B — smooth only the first few frames toward that T-pose so
-            #           physics eases in naturally.
-            # The end frames are left completely untouched — they should look
-            # exactly like the physics sim ended (body on the ground, etc.).
+            # Overwrite frame 1 with T-pose, then ease in over the first few frames.
             _restore_nonloop_start_to_tpose(action, frame_start, bone_names)
             _smooth_boundary_frames(action, frame_start, frame_end, bone_names, smooth_ends='start')
 
-        # ALWAYS clean frame 0 (T-pose) so baked values don't bleed in
+        # LINEAR: eliminates BEZIER sub-frame overshoots that cause real-time wobble.
+        _set_linear_interpolation(action, bone_names)
+        # Always clean frame 0 so T-pose bind frame never contains physics data.
         _clean_tpose_keyframes(action, bone_names)
 
     armature_obj.wiggle_freeze = True
     return True, "Baked successfully"
-
-
-def _restore_nonloop_start_to_tpose(action, frame_start, bone_names):
-    """For non-looping animations: replace the baked frame_start keyframe
-    values with T-pose identity transforms for the breast bones.
-
-    Why: the baked frame 1 comes from the physics preroll which may have
-    left the spring in a slightly displaced state, causing a visible pop
-    right at the start. Overwriting with identity gives physics a clean
-    neutral origin — the boobs start at rest and then naturally follow
-    the body motion as the animation plays.
-
-    Identity values by channel type:
-      rotation_quaternion: w=1, x=y=z=0
-      rotation_euler:      0, 0, 0
-      location:            0, 0, 0
-      scale:               1, 1, 1
-    """
-    bone_set = set(b for b in bone_names if b)
-
-    for fcurve in action.fcurves:
-        dp = fcurve.data_path
-        if 'pose.bones["' not in dp:
-            continue
-        try:
-            bname = dp.split('pose.bones["')[1].split('"]')[0]
-        except Exception:
-            continue
-        if bname not in bone_set:
-            continue
-
-        prop = dp.split('].')[-1] if '].' in dp else ''
-        idx = fcurve.array_index
-
-        if 'location' in prop:
-            identity = 0.0
-        elif 'rotation_quaternion' in prop:
-            identity = 1.0 if idx == 0 else 0.0
-        elif 'rotation_euler' in prop:
-            identity = 0.0
-        elif 'scale' in prop:
-            identity = 1.0
-        else:
-            continue
-
-        # Overwrite or insert at frame_start with the identity value
-        kp = fcurve.keyframe_points.insert(
-            frame_start, identity, options={'FAST', 'REPLACE'}
-        )
-        kp.interpolation = 'BEZIER'
-        fcurve.update()
-
-
-def _smooth_boundary_frames(action, frame_start, frame_end, bone_names,
-                             smooth_range=3, smooth_ends='both'):
-    """Smooth baked boundary frames toward the anchor keyframe to remove
-    physics spikes at animation start and/or end.
-
-    smooth_ends: 'both'  - smooth first AND last smooth_range frames (loops)
-                 'start' - smooth only the first smooth_range frames (non-loops)
-
-    Blends toward the actual anchor frame value (frame_start / frame_end)
-    rather than an arbitrary 'settled' frame further in, which may itself
-    still be in a spring transient.
-    """
-    bone_set = set(b for b in bone_names if b)
-
-    for fcurve in action.fcurves:
-        dp = fcurve.data_path
-        if 'pose.bones["' not in dp:
-            continue
-        try:
-            bname = dp.split('pose.bones["')[1].split('"]')[0]
-        except Exception:
-            continue
-        if bname not in bone_set:
-            continue
-
-        kf_map = {int(kp.co[0]): kp for kp in fcurve.keyframe_points}
-
-        # --- Smooth the FIRST smooth_range frames ---
-        # Blend frames (frame_start+1)..(frame_start+smooth_range) toward
-        # frame_start. For non-loop this is now T-pose identity (set above);
-        # for loop this is the first settled physics frame.
-        anchor_kp = kf_map.get(frame_start)
-        if anchor_kp:
-            anchor_val = anchor_kp.co[1]
-            for i in range(1, smooth_range + 1):
-                f = frame_start + i
-                kp = kf_map.get(f)
-                if kp is None:
-                    continue
-                t = i / (smooth_range + 1)  # 0→1: fully anchor → fully baked
-                kp.co[1] = anchor_val * (1.0 - t) + kp.co[1] * t
-
-        # --- Smooth the LAST smooth_range frames (loops only) ---
-        if smooth_ends == 'both':
-            anchor_kp = kf_map.get(frame_end)
-            if anchor_kp:
-                anchor_val = anchor_kp.co[1]
-                for i in range(1, smooth_range + 1):
-                    f = frame_end - i
-                    kp = kf_map.get(f)
-                    if kp is None:
-                        continue
-                    t = i / (smooth_range + 1)
-                    kp.co[1] = anchor_val * (1.0 - t) + kp.co[1] * t
-
-        fcurve.update()
-
-
-def _force_loop_perfect_match(action, frame_start, frame_end, bone_names):
-    """For perfect loops, Wiggle's 3x preroll naturally syncs the physics.
-    We just need to ensure the very last frame is exactly numerically identical 
-    to the first frame so the engine doesn't stutter, without destroying the
-    mid-frame momentum by blending.
-    """
-    bone_set = set(b for b in bone_names if b)
-
-    for fcurve in action.fcurves:
-        dp = fcurve.data_path
-        if 'pose.bones["' not in dp:
-            continue
-        try:
-            bname = dp.split('pose.bones["')[1].split('"]')[0]
-        except Exception:
-            continue
-        if bname not in bone_set:
-            continue
-
-        kf_map = {int(kp.co[0]): kp for kp in fcurve.keyframe_points}
-
-        first_kp = kf_map.get(frame_start)
-        if first_kp is None:
-            continue
-            
-        target_val = first_kp.co[1]
-
-        # Guarantee the last frame matches the first frame. No blending required.
-        last_kp = kf_map.get(frame_end)
-        if last_kp:
-            last_kp.co[1] = target_val
-        else:
-            fcurve.keyframe_points.insert(frame_end, target_val,
-                                          options={'FAST', 'REPLACE'})
-        fcurve.update()
-
-
-def _clean_tpose_keyframes(action, bone_names):
-    """Insert identity-transform keyframes at frame 0 for breast bones.
-    This prevents baked physics values from bleeding into the T-pose when
-    scrubbing to frame 0 in the timeline or during export.
-    Uses CONSTANT interpolation so there's a hard cut between T-pose and
-    the first animation frame — no weird blending.
-    """
-    bone_set = set(b for b in bone_names if b)
-
-    for fcurve in action.fcurves:
-        dp = fcurve.data_path
-        if 'pose.bones["' not in dp:
-            continue
-        try:
-            bname = dp.split('pose.bones["')[1].split('"]')[0]
-        except Exception:
-            continue
-        if bname not in bone_set:
-            continue
-
-        # Figure out the identity value for this channel
-        prop = dp.split('].')[-1] if '].' in dp else ''
-        idx = fcurve.array_index
-
-        if 'location' in prop:
-            identity = 0.0
-        elif 'rotation_quaternion' in prop:
-            identity = 1.0 if idx == 0 else 0.0  # (w=1, x=0, y=0, z=0)
-        elif 'rotation_euler' in prop:
-            identity = 0.0
-        elif 'scale' in prop:
-            identity = 1.0
-        else:
-            continue
-
-        # Insert at frame 0 with CONSTANT interpolation
-        kp = fcurve.keyframe_points.insert(0, identity, options={'FAST', 'REPLACE'})
-        kp.interpolation = 'CONSTANT'
-        fcurve.update()
-
-
-def _strip_physics_keyframes(action, bone_names):
-    """Remove all fcurves for the specified bones from the action.
-
-    Called before re-baking so that changing the intensity and clicking
-    Preview again starts from a clean slate instead of compounding on the
-    previous bake. Only removes curves belonging to the breast bones —
-    all other animation data is left intact.
-    """
-    bone_set = set(b for b in bone_names if b)
-    curves_to_remove = []
-
-    for fcurve in action.fcurves:
-        dp = fcurve.data_path
-        if 'pose.bones["' not in dp:
-            continue
-        try:
-            bname = dp.split('pose.bones["')[1].split('"]')[0]
-        except Exception:
-            continue
-        if bname in bone_set:
-            curves_to_remove.append(fcurve)
-
-    for fc in curves_to_remove:
-        action.fcurves.remove(fc)
 
 
 # ---------------------------------------------------------------------------
@@ -709,19 +267,16 @@ def _strip_physics_keyframes(action, bone_names):
 
 class BOOBS_OT_AutoDetectBones(Operator):
     """Try to auto-detect breast bones from common naming conventions"""
-    bl_idname = "boobs_physics.auto_detect"
-    bl_label = "Auto-Detect Breast Bones"
+    bl_idname    = "boobs_physics.auto_detect"
+    bl_label     = "Auto-Detect Breast Bones"
     bl_description = "Scan the armature for common breast bone names"
-    bl_options = {'REGISTER'}
+    bl_options   = {'REGISTER'}
 
-    # Common naming patterns for breast bones in LoL models
     PATTERNS_LEFT = [
         'L_Breast', 'Breast_L', 'breast_l', 'l_breast',
         'L_Boob', 'Boob_L', 'boob_l', 'l_boob',
         'Breast1_L', 'L_Breast1', 'Breast_01_L',
         'L_Bust', 'Bust_L', 'bust_l',
-        'C_Buffbone_Glb_Chest_Loc',  # some LoL models
-        'Buffbone_Glb_Chest_Loc',
     ]
     PATTERNS_RIGHT = [
         'R_Breast', 'Breast_R', 'breast_r', 'r_breast',
@@ -731,41 +286,35 @@ class BOOBS_OT_AutoDetectBones(Operator):
     ]
 
     def execute(self, context):
-        props = context.scene.boobs_physics
+        props        = context.scene.boobs_physics
         armature_obj = find_armature(context)
-
         if not armature_obj:
             self.report({'ERROR'}, "No armature found in scene")
             return {'CANCELLED'}
 
         bone_names = [b.name for b in armature_obj.pose.bones]
+        found_l = next((p for p in self.PATTERNS_LEFT  if p in bone_names), "")
+        found_r = next((p for p in self.PATTERNS_RIGHT if p in bone_names), "")
 
-        # Try exact matches first
-        found_l = ""
-        found_r = ""
-
-        for pattern in self.PATTERNS_LEFT:
-            if pattern in bone_names:
-                found_l = pattern
-                break
-
-        for pattern in self.PATTERNS_RIGHT:
-            if pattern in bone_names:
-                found_r = pattern
-                break
-
-        # If exact match failed, try case-insensitive substring match
+        # Case-insensitive substring fallback (never match buffbones — VFX only)
         if not found_l:
             for bname in bone_names:
                 bl = bname.lower()
-                if ('breast' in bl or 'boob' in bl or 'bust' in bl) and ('_l' in bl or 'l_' in bl or bl.endswith('_l') or bl.startswith('l_') or '.l' in bl):
+                if 'buffbone' in bl:
+                    continue
+                if ('breast' in bl or 'boob' in bl or 'bust' in bl) and \
+                   ('_l' in bl or 'l_' in bl or bl.endswith('_l') or
+                    bl.startswith('l_') or '.l' in bl):
                     found_l = bname
                     break
-
         if not found_r:
             for bname in bone_names:
                 bl = bname.lower()
-                if ('breast' in bl or 'boob' in bl or 'bust' in bl) and ('_r' in bl or 'r_' in bl or bl.endswith('_r') or bl.startswith('r_') or '.r' in bl):
+                if 'buffbone' in bl:
+                    continue
+                if ('breast' in bl or 'boob' in bl or 'bust' in bl) and \
+                   ('_r' in bl or 'r_' in bl or bl.endswith('_r') or
+                    bl.startswith('r_') or '.r' in bl):
                     found_r = bname
                     break
 
@@ -775,32 +324,48 @@ class BOOBS_OT_AutoDetectBones(Operator):
             props.breast_bone_R = found_r
 
         if found_l or found_r:
-            msg = f"Found: {found_l or '(none)'} + {found_r or '(none)'}"
-            self.report({'INFO'}, msg)
+            self.report({'INFO'}, f"Found: {found_l or '(none)'} + {found_r or '(none)'}")
         else:
             self.report({'WARNING'}, "Could not auto-detect breast bones. Please select them manually.")
+        return {'FINISHED'}
 
+
+class BOOBS_OT_AutoDetectCollisionBones(Operator):
+    """Scan the armature for common arm/shoulder bones and fill the collision list"""
+    bl_idname  = "boobs_physics.auto_detect_collision"
+    bl_label   = "Auto-Detect Collision Bones"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        props        = context.scene.boobs_physics
+        armature_obj = find_armature(context)
+        if not armature_obj:
+            self.report({'ERROR'}, "No armature found"); return {'CANCELLED'}
+        found = find_default_collision_bones(armature_obj)
+        if found:
+            props.collision_bones        = ", ".join(found)
+            props.collision_sphere_factor = 1.0
+            self.report({'INFO'}, f"Found {len(found)} bones: {', '.join(found)}")
+        else:
+            self.report({'WARNING'}, "No common arm/clavicle bones found — enter names manually.")
         return {'FINISHED'}
 
 
 class BOOBS_OT_PreviewPhysics(Operator):
     """Apply jiggle physics to the current animation for preview"""
-    bl_idname = "boobs_physics.preview"
-    bl_label = "Preview Jiggle"
+    bl_idname    = "boobs_physics.preview"
+    bl_label     = "Preview Jiggle"
     bl_description = "Apply jiggle physics to the current animation and bake it for preview"
-    bl_options = {'REGISTER'}
+    bl_options   = {'REGISTER'}
 
     def execute(self, context):
-        props = context.scene.boobs_physics
+        props        = context.scene.boobs_physics
         armature_obj = find_armature(context)
 
         if not armature_obj:
-            self.report({'ERROR'}, "No armature found in scene")
-            return {'CANCELLED'}
+            self.report({'ERROR'}, "No armature found in scene"); return {'CANCELLED'}
 
-        bone_names = [props.breast_bone_L, props.breast_bone_R]
-        bone_names = [b for b in bone_names if b]
-
+        bone_names = [b for b in [props.breast_bone_L, props.breast_bone_R] if b]
         if not bone_names:
             self.report({'ERROR'}, "No breast bones selected. Use Auto-Detect or pick them manually.")
             return {'CANCELLED'}
@@ -811,162 +376,169 @@ class BOOBS_OT_PreviewPhysics(Operator):
 
         current_action = armature_obj.animation_data.action
 
-        # Step 1: Snapshot the action BEFORE touching it so Undo Preview can
-        # restore exactly this state. Delete any stale backup from a prior preview.
+        # Snapshot current action so Undo Preview can restore it exactly.
         if props.backup_action_name:
-            old_backup = bpy.data.actions.get(props.backup_action_name)
-            if old_backup:
-                bpy.data.actions.remove(old_backup)
+            old = bpy.data.actions.get(props.backup_action_name)
+            if old:
+                bpy.data.actions.remove(old)
             props.backup_action_name = ""
 
         backup = current_action.copy()
-        backup.name = f"__boobs_bkp_{current_action.name}"
+        backup.name          = f"__boobs_bkp_{current_action.name}"
         backup.use_fake_user = True
         props.backup_action_name = backup.name
 
-        # Step 2: Strip any existing physics keyframes for these bones so
-        # re-baking at a different intensity doesn't stack on the old bake.
-        _strip_physics_keyframes(current_action, bone_names)
+        # Strip existing physics keyframes so re-baking at a new intensity
+        # starts clean rather than stacking on the old bake.
+        strip_physics_keyframes(current_action, bone_names)
 
-        # Step 3: Unfreeze + configure wiggle
         armature_obj.wiggle_freeze = False
         configured = apply_wiggle_to_bones(context, armature_obj, bone_names, props.jiggle_intensity)
         if not configured:
             self.report({'ERROR'}, "Could not find the specified bones in the armature")
             return {'CANCELLED'}
 
-        # Step 4: Bake
         props.status_text = "Baking physics preview..."
-        success, message = bake_wiggle_for_current_action(
+        ok, message = bake_wiggle_for_current_action(
             context, armature_obj, bone_names, props.jiggle_intensity
         )
 
-        if not success:
+        if not ok:
             props.status_text = f"Preview failed: {message}"
-            self.report({'ERROR'}, message)
-            return {'CANCELLED'}
+            self.report({'ERROR'}, message); return {'CANCELLED'}
 
-        # Step 5: Disable wiggle on bones (keyframes are already baked in)
+        if props.collision_enabled or props.boob_self_collision:
+            coll_bones = []
+            if props.collision_enabled:
+                coll_bones = [n.strip() for n in props.collision_bones.split(',') if n.strip()]
+            props.status_text = "Applying collision correction..."
+            n_fixed = post_bake_collision_correct(
+                context, armature_obj, bone_names, coll_bones,
+                sphere_factor=props.collision_sphere_factor,
+                self_coll_enabled=props.boob_self_collision,
+                self_coll_scale=props.boob_self_collision_scale,
+            )
+            if n_fixed:
+                self.report({'INFO'}, f"Collision: corrected {n_fixed} frames")
+
+            # Re-snap loop seam.
+            act = armature_obj.animation_data and armature_obj.animation_data.action
+            if act:
+                fs = max(1, int(act.frame_range[0]))
+                fe = int(act.frame_range[1])
+                if _detect_animation_loops(act, fs, fe):
+                    _force_loop_perfect_match(act, fs, fe, bone_names)
+
         clear_wiggle_from_bones(context, armature_obj, bone_names)
-
         props.status_text = "Preview ready — play the animation!"
         self.report({'INFO'}, f"Jiggle physics baked on: {', '.join(configured)}")
-
         ensure_object_mode(context)
         return {'FINISHED'}
 
 
 class BOOBS_OT_UndoPreview(Operator):
     """Restore the animation to the state it was in before Preview Jiggle"""
-    bl_idname = "boobs_physics.undo_preview"
-    bl_label = "Undo Preview"
+    bl_idname    = "boobs_physics.undo_preview"
+    bl_label     = "Undo Preview"
     bl_description = "Restore the animation to exactly how it was before Preview Jiggle was clicked"
-    bl_options = {'REGISTER'}
+    bl_options   = {'REGISTER'}
 
     def execute(self, context):
-        props = context.scene.boobs_physics
+        props        = context.scene.boobs_physics
         armature_obj = find_armature(context)
-
         if not armature_obj:
-            self.report({'ERROR'}, "No armature found")
-            return {'CANCELLED'}
+            self.report({'ERROR'}, "No armature found"); return {'CANCELLED'}
 
         armature_obj.wiggle_freeze = False
-        bone_names = [props.breast_bone_L, props.breast_bone_R]
-        clear_wiggle_from_bones(context, armature_obj, bone_names)
+        clear_wiggle_from_bones(context, armature_obj,
+                                [props.breast_bone_L, props.breast_bone_R])
 
-        # Restore from snapshot if one exists
         if props.backup_action_name:
             backup = bpy.data.actions.get(props.backup_action_name)
             if backup:
-                # Remove the baked action and swap back to the original
-                baked_action = armature_obj.animation_data.action if armature_obj.animation_data else None
+                baked = armature_obj.animation_data.action if armature_obj.animation_data else None
                 armature_obj.animation_data.action = backup
-                backup.name = backup.name.replace("__boobs_bkp_", "", 1)
+                backup.name          = backup.name.replace("__boobs_bkp_", "", 1)
                 backup.use_fake_user = False
-                if baked_action and baked_action != backup:
-                    bpy.data.actions.remove(baked_action)
+                if baked and baked != backup:
+                    bpy.data.actions.remove(baked)
                 props.backup_action_name = ""
+
+                context.scene.frame_start = 1
+                context.scene.frame_end   = int(backup.frame_range[1])
+                ensure_object_mode(context)
+                context.scene.frame_set(1)
                 props.status_text = "Ready"
                 self.report({'INFO'}, "Restored to pre-preview state.")
-                ensure_object_mode(context)
                 return {'FINISHED'}
 
-        # No backup — nothing to restore
         props.status_text = "Ready"
         self.report({'WARNING'}, "No preview backup found. Nothing to restore.")
         return {'FINISHED'}
 
 
-# ---------------------------------------------------------------------------
-#  Animation folder browsing operators (pattern from anim_loader)
-# ---------------------------------------------------------------------------
-
 class BOOBS_OT_BrowseFolder(Operator):
-    """Browse for animation folder"""
-    bl_idname = "boobs_physics.browse_folder"
-    bl_label = "Browse Animations Folder"
+    """Browse for animations folder"""
+    bl_idname    = "boobs_physics.browse_folder"
+    bl_label     = "Browse Animations Folder"
     bl_description = "Choose a folder containing .anm animation files"
-    bl_options = {'REGISTER'}
+    bl_options   = {'REGISTER'}
 
     directory: StringProperty(subtype='DIR_PATH')
 
     def execute(self, context):
-        props = context.scene.boobs_physics
         if self.directory:
-            props.custom_folder = self.directory.rstrip('/\\')
+            context.scene.boobs_physics.custom_folder = self.directory.rstrip('/\\')
             bpy.ops.boobs_physics.refresh_anims()
         return {'FINISHED'}
 
-    def invoke(self, context, event):
+    def invoke(self, context, _event):
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
 
 class BOOBS_OT_BrowseExportFolder(Operator):
     """Browse for export folder"""
-    bl_idname = "boobs_physics.browse_export_folder"
-    bl_label = "Browse Export Folder"
+    bl_idname    = "boobs_physics.browse_export_folder"
+    bl_label     = "Browse Export Folder"
     bl_description = "Choose a folder to export baked animations"
-    bl_options = {'REGISTER'}
+    bl_options   = {'REGISTER'}
 
     directory: StringProperty(subtype='DIR_PATH')
 
     def execute(self, context):
-        props = context.scene.boobs_physics
         if self.directory:
-            props.export_folder = self.directory.rstrip('/\\')
+            context.scene.boobs_physics.export_folder = self.directory.rstrip('/\\')
         return {'FINISHED'}
 
-    def invoke(self, context, event):
+    def invoke(self, context, _event):
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
 
 class BOOBS_OT_ClearFolder(Operator):
     """Clear custom folder"""
-    bl_idname = "boobs_physics.clear_folder"
-    bl_label = "Clear Custom Folder"
+    bl_idname  = "boobs_physics.clear_folder"
+    bl_label   = "Clear Custom Folder"
     bl_options = {'REGISTER'}
 
     def execute(self, context):
-        props = context.scene.boobs_physics
-        props.custom_folder = ""
+        context.scene.boobs_physics.custom_folder = ""
         bpy.ops.boobs_physics.refresh_anims()
         return {'FINISHED'}
 
 
 class BOOBS_OT_RefreshAnims(Operator):
     """Scan the animations folder and refresh the list"""
-    bl_idname = "boobs_physics.refresh_anims"
-    bl_label = "Refresh Animations"
+    bl_idname  = "boobs_physics.refresh_anims"
+    bl_label   = "Refresh Animations"
     bl_options = {'REGISTER'}
 
     def execute(self, context):
         props = context.scene.boobs_physics
         props.animations.clear()
         props.animations_folder = ""
-        props.search_filter = ""
+        props.search_filter     = ""
 
         if props.custom_folder and os.path.isdir(props.custom_folder):
             anim_folder = props.custom_folder
@@ -981,81 +553,76 @@ class BOOBS_OT_RefreshAnims(Operator):
                 return {'CANCELLED'}
 
         props.animations_folder = anim_folder
-
-        anm_files = sorted([f for f in os.listdir(anim_folder) if f.lower().endswith('.anm')])
+        anm_files = sorted(f for f in os.listdir(anim_folder) if f.lower().endswith('.anm'))
 
         for filename in anm_files:
-            item = props.animations.add()
-            item.name = os.path.splitext(filename)[0]
+            item          = props.animations.add()
+            item.name     = os.path.splitext(filename)[0]
             item.filepath = os.path.join(anim_folder, filename)
 
         if anm_files:
             self.report({'INFO'}, f"Found {len(anm_files)} animations")
         else:
             self.report({'WARNING'}, f"No .anm files in: {anim_folder}")
-
         return {'FINISHED'}
 
 
 class BOOBS_OT_LoadAnimation(Operator):
     """Load a single animation for preview"""
-    bl_idname = "boobs_physics.load_anim"
-    bl_label = "Load Animation"
+    bl_idname  = "boobs_physics.load_anim"
+    bl_label   = "Load Animation"
     bl_options = {'REGISTER', 'UNDO'}
 
-    filepath: StringProperty()
-    anim_name: StringProperty()
-    index: IntProperty(default=-1)
+    filepath:   StringProperty()
+    anim_name:  StringProperty()
+    index:      IntProperty(default=-1)
 
     def execute(self, context):
         props = context.scene.boobs_physics
 
         if not self.filepath or not os.path.exists(self.filepath):
-            self.report({'ERROR'}, "Animation file not found")
-            return {'CANCELLED'}
+            self.report({'ERROR'}, "Animation file not found"); return {'CANCELLED'}
 
         armature_obj = find_armature(context)
         if not armature_obj:
-            self.report({'ERROR'}, "No armature found")
-            return {'CANCELLED'}
+            self.report({'ERROR'}, "No armature found"); return {'CANCELLED'}
 
         select_armature(context, armature_obj)
-
-        # Unfreeze wiggle
         armature_obj.wiggle_freeze = False
 
-        # Reset breast bones to identity BEFORE loading the new animation.
-        # If the timeline was mid-playback the bones may still be in a baked
-        # physics pose; leaving them there contaminates the new action's T-pose.
+        # Reset breast bones to identity BEFORE loading so a mid-playback pose
+        # doesn't contaminate the new action's T-pose frame.
         bpy.ops.object.mode_set(mode='POSE')
         for bname in [props.breast_bone_L, props.breast_bone_R]:
             if not bname:
                 continue
             pb = armature_obj.pose.bones.get(bname)
             if pb:
-                pb.location = (0.0, 0.0, 0.0)
+                pb.location            = (0.0, 0.0, 0.0)
                 pb.rotation_quaternion = (1.0, 0.0, 0.0, 0.0)
-                pb.rotation_euler = (0.0, 0.0, 0.0)
-                pb.scale = (1.0, 1.0, 1.0)
+                pb.rotation_euler      = (0.0, 0.0, 0.0)
+                pb.scale               = (1.0, 1.0, 1.0)
         bpy.ops.object.mode_set(mode='OBJECT')
 
         try:
             action_name = self.anim_name or os.path.splitext(os.path.basename(self.filepath))[0]
-            anm = import_anm.read_anm(self.filepath)
+            anm         = import_anm.read_anm(self.filepath)
 
             if not armature_obj.animation_data:
                 armature_obj.animation_data_create()
 
             new_action = bpy.data.actions.new(name=action_name)
             armature_obj.animation_data.action = new_action
-
             import_anm.apply_anm(anm, armature_obj, frame_offset=0)
-
             new_action["lol_anm_filepath"] = self.filepath
             new_action["lol_anm_filename"] = os.path.basename(self.filepath)
 
-            props.current_loaded = action_name
+            frame_end = int(new_action.frame_range[1])
+            context.scene.frame_start   = 1
+            context.scene.frame_end     = frame_end
+            context.scene.frame_current = 1
 
+            props.current_loaded = action_name
             if self.index >= 0:
                 props.active_index = self.index
 
@@ -1065,7 +632,7 @@ class BOOBS_OT_LoadAnimation(Operator):
 
         except Exception as e:
             props.status_text = "Import failed"
-            self.report({'ERROR'}, f"Failed: {str(e)}")
+            self.report({'ERROR'}, f"Failed: {e}")
             import traceback
             traceback.print_exc()
             return {'CANCELLED'}
@@ -1073,73 +640,57 @@ class BOOBS_OT_LoadAnimation(Operator):
 
 class BOOBS_OT_ApplyToAll(Operator):
     """Apply jiggle physics to all animations in the folder, bake, and export"""
-    bl_idname = "boobs_physics.apply_all"
-    bl_label = "Apply to All Animations"
+    bl_idname    = "boobs_physics.apply_all"
+    bl_label     = "Apply to All Animations"
     bl_description = "Import each animation, apply jiggle, bake, and export to the output folder"
-    bl_options = {'REGISTER'}
+    bl_options   = {'REGISTER'}
 
     def execute(self, context):
-        props = context.scene.boobs_physics
+        props        = context.scene.boobs_physics
         armature_obj = find_armature(context)
 
         if not armature_obj:
-            self.report({'ERROR'}, "No armature found in scene")
-            return {'CANCELLED'}
+            self.report({'ERROR'}, "No armature found in scene"); return {'CANCELLED'}
 
-        bone_names = [props.breast_bone_L, props.breast_bone_R]
-        bone_names = [b for b in bone_names if b]
-
+        bone_names = [b for b in [props.breast_bone_L, props.breast_bone_R] if b]
         if not bone_names:
-            self.report({'ERROR'}, "No breast bones selected")
-            return {'CANCELLED'}
+            self.report({'ERROR'}, "No breast bones selected"); return {'CANCELLED'}
 
         if len(props.animations) == 0:
             self.report({'ERROR'}, "No animations loaded. Click Refresh first.")
             return {'CANCELLED'}
 
-        # Determine export folder
-        export_dir = props.export_folder
-        if not export_dir:
-            # Default: same as source folder
-            export_dir = props.animations_folder
+        export_dir = props.export_folder or props.animations_folder
         if not export_dir or not os.path.isdir(export_dir):
             self.report({'ERROR'}, "No valid export folder. Set one or ensure animations folder exists.")
             return {'CANCELLED'}
 
         select_armature(context, armature_obj)
-
         if not armature_obj.animation_data:
             armature_obj.animation_data_create()
 
-        # SPEED OPTIMIZATION: Disable global undo to prevent RAM throttling!
+        # Disable global undo to prevent RAM throttling during batch processing.
         user_undo = context.preferences.edit.use_global_undo
         context.preferences.edit.use_global_undo = False
-        
-        # Store original action
+
         original_action = armature_obj.animation_data.action
-
-        total = len(props.animations)
+        total   = len(props.animations)
+        fps     = context.scene.render.fps
         success_count = 0
-        fail_count = 0
-        fps = context.scene.render.fps
+        fail_count    = 0
 
-        # Configure wiggle on breast bones ONCE (properties persist on PoseBone)
-        apply_wiggle_to_bones(context, armature_obj, bone_names, props.jiggle_intensity)
+        # Pre-compute collision radii once — they're static (bone_len × factor).
+        coll_bones_for_batch   = []
+        precomputed_coll_radii = None
+        if props.collision_enabled:
+            coll_bones_for_batch = [n.strip() for n in props.collision_bones.split(',') if n.strip()]
+            if coll_bones_for_batch:
+                precomputed_coll_radii = precompute_collision_radii(armature_obj, coll_bones_for_batch)
 
-        # SPEED OPTIMIZATION: Hide all meshes and disable their armature modifiers
-        # This stops Blender from recalculating thousands of vertices per frame
-        # during the physics preroll and bake stages, cutting processing time immensely.
-        disabled_armature_mods = []
-        hidden_meshes = []
-        for obj in context.scene.objects:
-            if obj.type == 'MESH':
-                for mod in obj.modifiers:
-                    if mod.type == 'ARMATURE' and mod.show_viewport:
-                        mod.show_viewport = False
-                        disabled_armature_mods.append(mod)
-                if not obj.hide_viewport:
-                    obj.hide_viewport = True
-                    hidden_meshes.append(obj)
+        # Hide all meshes to stop Blender recalculating vertex deformations per frame.
+        disabled_mods, hidden_objs = hide_meshes_for_batch(context)
+
+        # Configure wiggle once after mesh hiding (mode switch is now safe).
         apply_wiggle_to_bones(context, armature_obj, bone_names, props.jiggle_intensity)
 
         for idx, anim_item in enumerate(props.animations):
@@ -1147,32 +698,28 @@ class BOOBS_OT_ApplyToAll(Operator):
             bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
 
             try:
-                # 1. Unfreeze and HARD RESET physics between animations.
-                # Without this, velocity/position state from the previous
-                # animation bleeds into the next one's preroll and causes
-                # glitches on the first frames of the baked output.
+                # Hard-reset physics between animations so velocity/position
+                # from the previous clip doesn't bleed into the next preroll.
                 armature_obj.wiggle_freeze = False
                 try:
                     bpy.ops.wiggle.reset()
                 except Exception:
                     pass
 
-                # 2. Import animation — must go to object mode first
                 ensure_object_mode(context)
                 select_armature(context, armature_obj)
 
-                anm = import_anm.read_anm(anim_item.filepath)
-                action_name = anim_item.name
-                new_action = bpy.data.actions.new(name=action_name)
+                anm        = import_anm.read_anm(anim_item.filepath)
+                new_action = bpy.data.actions.new(name=anim_item.name)
                 armature_obj.animation_data.action = new_action
                 import_anm.apply_anm(anm, armature_obj, frame_offset=0)
                 new_action["lol_anm_filepath"] = anim_item.filepath
 
-                # 3. Re-apply wiggle settings each iteration so they persist
-                # after mode switches done inside bake_wiggle_for_current_action.
+                # Re-apply wiggle each iteration: bake_wiggle_for_current_action may
+                # change effective_intensity for non-loop clips, so the next iteration
+                # (which could be a loop) needs the full intensity restored.
                 apply_wiggle_to_bones(context, armature_obj, bone_names, props.jiggle_intensity)
 
-                # 4. Bake physics (uses wiggle.bake with preroll)
                 ok, msg = bake_wiggle_for_current_action(
                     context, armature_obj, bone_names, props.jiggle_intensity
                 )
@@ -1181,10 +728,24 @@ class BOOBS_OT_ApplyToAll(Operator):
                     fail_count += 1
                     continue
 
-                # 4. Export to ANM (baked keyframes are in the action)
+                if coll_bones_for_batch or props.boob_self_collision:
+                    post_bake_collision_correct(
+                        context, armature_obj, bone_names, coll_bones_for_batch,
+                        sphere_factor=props.collision_sphere_factor,
+                        precomputed_radii=precomputed_coll_radii,
+                        self_coll_enabled=props.boob_self_collision,
+                        self_coll_scale=props.boob_self_collision_scale,
+                    )
+                    # Re-snap loop seam after collision correction.
+                    act = armature_obj.animation_data.action
+                    if act:
+                        fs = max(1, int(act.frame_range[0]))
+                        fe = int(act.frame_range[1])
+                        if _detect_animation_loops(act, fs, fe):
+                            _force_loop_perfect_match(act, fs, fe, bone_names)
+
                 out_path = os.path.join(export_dir, f"{anim_item.name}.anm")
                 export_anm.write_anm(out_path, armature_obj, fps)
-
                 success_count += 1
 
             except Exception as e:
@@ -1193,10 +754,8 @@ class BOOBS_OT_ApplyToAll(Operator):
                 traceback.print_exc()
                 fail_count += 1
 
-        # Clean up wiggle from bones after all done
         clear_wiggle_from_bones(context, armature_obj, bone_names)
 
-        # Restore original action
         try:
             armature_obj.animation_data.action = original_action
         except Exception:
@@ -1204,64 +763,49 @@ class BOOBS_OT_ApplyToAll(Operator):
 
         armature_obj.wiggle_freeze = False
         ensure_object_mode(context)
+        restore_meshes_after_batch(disabled_mods, hidden_objs)
 
-        # SPEED OPTIMIZATION: Restore meshes
-        for mod in disabled_armature_mods:
-            mod.show_viewport = True
-        for obj in hidden_meshes:
-            obj.hide_viewport = False
 
         props.status_text = "Ready"
+        context.preferences.edit.use_global_undo = user_undo
 
         if fail_count > 0:
             self.report({'WARNING'}, f"Done: {success_count}/{total} exported ({fail_count} failed) to {export_dir}")
         else:
             self.report({'INFO'}, f"Done: {success_count} animations exported to {export_dir}")
-
-        context.preferences.edit.use_global_undo = user_undo
         return {'FINISHED'}
 
 
 # ---------------------------------------------------------------------------
-#  UI List for animations
+#  UI List
 # ---------------------------------------------------------------------------
 
 class BOOBS_UL_AnimList(UIList):
-    """Scrollable animation list with filtering"""
+    """Scrollable animation list with search filtering"""
 
-    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+    def draw_item(self, context, layout, _data, item, _icon, _active_data, _active_propname, index):
         props = context.scene.boobs_physics
-
         if self.layout_type in {'DEFAULT', 'COMPACT'}:
             row = layout.row(align=True)
-            if item.name == props.current_loaded:
-                row.label(text="", icon='PLAY')
-            else:
-                row.label(text="", icon='ACTION')
-
+            row.label(text="", icon='PLAY' if item.name == props.current_loaded else 'ACTION')
             op = row.operator("boobs_physics.load_anim", text=item.name, emboss=False)
-            op.filepath = item.filepath
+            op.filepath  = item.filepath
             op.anim_name = item.name
-            op.index = index
-
+            op.index     = index
         elif self.layout_type == 'GRID':
             layout.alignment = 'CENTER'
             layout.label(text=item.name, icon='ACTION')
 
     def filter_items(self, context, data, propname):
-        props = context.scene.boobs_physics
-        items = getattr(data, propname)
+        props       = context.scene.boobs_physics
+        items       = getattr(data, propname)
         filter_name = props.search_filter.lower()
-
-        flt_flags = [self.bitflag_filter_item] * len(items)
-        flt_neworder = []
-
+        flt_flags   = [self.bitflag_filter_item] * len(items)
         if filter_name:
             for i, item in enumerate(items):
                 if filter_name not in item.name.lower():
                     flt_flags[i] = 0
-
-        return flt_flags, flt_neworder
+        return flt_flags, []
 
 
 # ---------------------------------------------------------------------------
@@ -1269,152 +813,129 @@ class BOOBS_UL_AnimList(UIList):
 # ---------------------------------------------------------------------------
 
 class BOOBS_PT_BoobsPhysics(Panel):
-    """Boobs Physics panel"""
-    bl_label = "Boobs Physics"
-    bl_idname = "VIEW3D_PT_boobs_physics"
-    bl_space_type = 'VIEW_3D'
+    bl_label       = "Boobs Physics"
+    bl_idname      = "VIEW3D_PT_boobs_physics"
+    bl_space_type  = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = 'Misc LoL Tools'
-    bl_options = {'DEFAULT_CLOSED'}
+    bl_category    = 'Misc LoL Tools'
+    bl_options     = {'DEFAULT_CLOSED'}
 
     def draw_header(self, context):
-        layout = self.layout
-        layout.label(text="", icon_value=icons.get_icon("icon_52"))
+        self.layout.label(text="", icon_value=icons.get_icon("icon_52"))
 
     def draw(self, context):
-        layout = self.layout
-        props = context.scene.boobs_physics
+        layout       = self.layout
+        props        = context.scene.boobs_physics
         armature_obj = find_armature(context)
 
         # Status
-        box = layout.box()
-        box.label(text=props.status_text, icon='INFO')
+        layout.box().label(text=props.status_text, icon='INFO')
 
         # --- Bone selection ---
         box = layout.box()
         box.label(text="Breast Bones", icon='BONE_DATA')
-
         if armature_obj:
-            row = box.row(align=True)
-            row.prop_search(props, "breast_bone_L", armature_obj.pose, "bones", text="Left")
-
-            row = box.row(align=True)
-            row.prop_search(props, "breast_bone_R", armature_obj.pose, "bones", text="Right")
-
+            box.row(align=True).prop_search(props, "breast_bone_L", armature_obj.pose, "bones", text="Left")
+            box.row(align=True).prop_search(props, "breast_bone_R", armature_obj.pose, "bones", text="Right")
             box.operator("boobs_physics.auto_detect", text="Auto-Detect", icon='VIEWZOOM')
         else:
             box.label(text="No armature in scene", icon='ERROR')
 
-        # --- Jiggle intensity slider ---
+        # --- Self-collision ---
+        box = layout.box()
+        box.row().prop(props, "boob_self_collision", text="Boobs Collision", icon='MESH_UVSPHERE')
+        if props.boob_self_collision:
+            box.column().prop(props, "boob_self_collision_scale", slider=True,
+                              text="Radius Scale (1.0 = auto)")
+
+        # --- Intensity slider ---
         box = layout.box()
         box.label(text="Jiggle Settings", icon='MOD_WAVE')
-
         col = box.column(align=True)
         col.prop(props, "jiggle_intensity", slider=True)
-
-        # Labels indicating the scale
         row = col.row(align=True)
         row.alignment = 'CENTER'
-        intensity = props.jiggle_intensity
-        if intensity <= 3:
-            row.label(text="▸ Subtle", icon='NONE')
-        elif intensity <= 7:
-            row.label(text="▸ Mild", icon='NONE')
-        elif intensity <= 13:
-            row.label(text="▸ Natural", icon='NONE')
-        elif intensity <= 17:
-            row.label(text="▸ Bouncy", icon='NONE')
-        else:
-            row.label(text="▸ Extreme!", icon='NONE')
+        i = props.jiggle_intensity
+        label = "▸ Subtle" if i <= 3 else "▸ Mild" if i <= 7 else "▸ Natural" if i <= 13 \
+            else "▸ Bouncy" if i <= 17 else "▸ Extreme!"
+        row.label(text=label)
 
-        # --- Preview controls ---
+        # --- Body collision ---
         box = layout.box()
-        box.label(text="Preview", icon='PLAY')
+        box.row().prop(props, "collision_enabled", text="Body Collision", icon='MESH_UVSPHERE')
+        if props.collision_enabled:
+            col = box.column(align=True)
+            col.label(text="Collision Bones (comma-separated):", icon='BONE_DATA')
+            col.prop(props, "collision_bones", text="")
+            col.operator("boobs_physics.auto_detect_collision",
+                         text="Auto-Detect Arm Bones", icon='VIEWZOOM')
+            col.separator()
+            col.prop(props, "collision_sphere_factor", slider=True, text="Radius Scale  (1.0 = auto)")
 
-        has_anim = bool(armature_obj and armature_obj.animation_data and armature_obj.animation_data.action)
+        # --- Preview ---
+        has_anim  = bool(armature_obj and armature_obj.animation_data and armature_obj.animation_data.action)
         has_bones = bool(props.breast_bone_L or props.breast_bone_R)
 
+        box = layout.box()
+        box.label(text="Preview", icon='PLAY')
         col = box.column(align=True)
         col.scale_y = 1.3
-
         row = col.row(align=True)
         row.enabled = has_anim and has_bones
         row.operator("boobs_physics.preview", text="Preview Jiggle", icon='MOD_WAVE')
-
         row = col.row(align=True)
         row.enabled = has_anim
         row.operator("boobs_physics.undo_preview", text="Undo Preview", icon='LOOP_BACK')
-
         if props.current_loaded:
             box.label(text=f"Animation: {props.current_loaded}", icon='ANIM')
 
-        # --- Animation folder & batch processing ---
+        # --- Batch processing ---
         box = layout.box()
         box.label(text="Batch Processing", icon='FILE_FOLDER')
 
-        # Folder controls
         row = box.row(align=True)
         row.operator("boobs_physics.refresh_anims", text="Refresh", icon='FILE_REFRESH')
         row.operator("boobs_physics.browse_folder", text="", icon='FILEBROWSER')
 
-        # Show current folder
         row = box.row(align=True)
         row.scale_y = 0.7
         if props.animations_folder:
             folder_name = os.path.basename(props.animations_folder)
             parent_name = os.path.basename(os.path.dirname(props.animations_folder))
+            row.label(text=f".../{parent_name}/{folder_name}", icon='FILE_FOLDER')
             if props.custom_folder:
-                row.label(text=f".../{parent_name}/{folder_name}", icon='FILE_FOLDER')
                 row.operator("boobs_physics.clear_folder", text="", icon='X')
-            else:
-                row.label(text=f".../{parent_name}/{folder_name}", icon='FILE_FOLDER')
         else:
             row.label(text="No folder selected", icon='FILE_FOLDER')
 
-        # Animation list
         if len(props.animations) > 0:
             filter_text = props.search_filter.lower()
             if filter_text:
-                visible = sum(1 for item in props.animations if filter_text in item.name.lower())
+                visible    = sum(1 for it in props.animations if filter_text in it.name.lower())
                 label_text = f"Animations ({visible}/{len(props.animations)})"
             else:
                 label_text = f"Animations ({len(props.animations)})"
+            box.row().label(text=label_text, icon='ANIM')
+            box.row().template_list("BOOBS_UL_AnimList", "",
+                                    props, "animations", props, "active_index", rows=8)
+            box.row(align=True).prop(props, "search_filter", text="", icon='VIEWZOOM')
 
-            row = box.row()
-            row.label(text=label_text, icon='ANIM')
-
-            row = box.row()
-            row.template_list(
-                "BOOBS_UL_AnimList", "",
-                props, "animations",
-                props, "active_index",
-                rows=8
-            )
-
-            row = box.row(align=True)
-            row.prop(props, "search_filter", text="", icon='VIEWZOOM')
-
-        # Export folder
+        # --- Export ---
         layout.separator()
         box = layout.box()
         box.label(text="Export", icon='EXPORT')
-
         row = box.row(align=True)
         row.label(text="Output Folder:", icon='FILE_FOLDER')
         row.operator("boobs_physics.browse_export_folder", text="", icon='FILEBROWSER')
-
+        row = box.row(align=True)
+        row.scale_y = 0.7
         if props.export_folder:
-            row = box.row(align=True)
-            row.scale_y = 0.7
             folder_name = os.path.basename(props.export_folder)
             parent_name = os.path.basename(os.path.dirname(props.export_folder))
             row.label(text=f".../{parent_name}/{folder_name}")
         else:
-            row = box.row(align=True)
-            row.scale_y = 0.7
             row.label(text="(defaults to source folder)")
 
-        # Apply to all button
         layout.separator()
         col = layout.column(align=True)
         col.scale_y = 1.5
@@ -1430,6 +951,7 @@ classes = [
     BoobsAnimListItem,
     BoobsPhysicsProperties,
     BOOBS_OT_AutoDetectBones,
+    BOOBS_OT_AutoDetectCollisionBones,
     BOOBS_OT_PreviewPhysics,
     BOOBS_OT_UndoPreview,
     BOOBS_OT_BrowseFolder,
