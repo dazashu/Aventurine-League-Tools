@@ -126,7 +126,6 @@ def write_anm(filepath, armature_obj, fps=30.0, disable_scaling=False, disable_t
         for f_idx in range(frame_count):
             frame = frame_start + f_idx
             bpy.context.scene.frame_set(frame)
-            bpy.context.view_layer.update()
             
             for pbone in bones:
                 # Get current animated Visual Local matrix

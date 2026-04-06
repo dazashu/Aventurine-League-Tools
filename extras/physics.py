@@ -60,13 +60,18 @@ def build_list():
 def update_prop(self,context,prop): 
     if prop in ['wiggle_mute','wiggle_enable']:
         build_list()
-    if type(self) == bpy.types.PoseBone: 
-        for b in context.selected_pose_bones:
-            b[prop] = self[prop]
+    if type(self) == bpy.types.PoseBone:
+        if context.selected_pose_bones is not None:
+            for b in context.selected_pose_bones:
+                try:
+                    b[prop] = self[prop]
+                except (TypeError, KeyError):
+                    pass  # PointerProperty set to None can't be copied via ID props
         if prop in ['wiggle_head', 'wiggle_tail']:
             build_list()
-            for b in context.selected_pose_bones:
-                reset_bone(b)
+            if context.selected_pose_bones is not None:
+                for b in context.selected_pose_bones:
+                    reset_bone(b)
     #edge case where is_rendering gets stuck, the user fiddling with any setting should unstuck it!
     context.scene.wiggle.is_rendering = False
         
