@@ -20,6 +20,8 @@ lol_maya-4.2.8/
 # Reference source code (used for building DLLs)
 ritobin-master/
 Ritoddstex-master/
+league-toolkit-main*/
+lol2gltf-main/
 
 # Legacy code folder (no longer used)
 LtMAO/

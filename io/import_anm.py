@@ -573,6 +573,17 @@ def apply_anm(anm, armature_obj, frame_offset=0, flip=False):
 
     print(f"Inserted {total_keyframes} keyframe channels")
 
+    # Blender 4.4/4.5 slotted actions: the legacy action.fcurves proxy creates
+    # keyframes inside a slot, but doesn't auto-bind that slot to the armature.
+    # Without this, the animation data exists but Blender never evaluates it.
+    # See https://projects.blender.org/blender/blender/issues/135236
+    anim_data = armature_obj.animation_data
+    if anim_data and anim_data.action:
+        if hasattr(anim_data, 'action_slot') and anim_data.action_slot is None:
+            act = anim_data.action
+            if hasattr(act, 'slots') and len(act.slots) > 0:
+                anim_data.action_slot = act.slots[0]
+
     bpy.ops.object.mode_set(mode='OBJECT')
 
     # Force update and reset to start frame
