@@ -31,12 +31,12 @@ from .physics_common import (
 )
 from .wiggle_bake_common import (
     _detect_animation_loops,
-    _force_loop_perfect_match,
+    _copy_loop_end_to_start,
     _restore_nonloop_start_to_tpose,
     _smooth_boundary_frames,
-    _velocity_match_loop,
     _set_linear_interpolation,
     _clean_tpose_keyframes,
+    _fix_quaternion_continuity,
 )
 
 
@@ -361,10 +361,8 @@ def _get_bone_names(props):
 def _bake_hair(context, arm, bone_names, intensity, coll_collection=None):
     """Detect loop, preroll, bake with optional real-time collision.
 
-    When coll_collection is provided (a Blender Collection of icosphere meshes
-    bone-parented to body bones), Wiggle 2's built-in collision system is
-    activated on all hair bones before the preroll. The simulation itself then
-    prevents hair from penetrating the body — no post-bake hack needed.
+    Same pipeline as boobs but with real-time collision mesh support
+    and higher solver iterations for chain physics.
     """
     scene = context.scene
 
@@ -383,8 +381,6 @@ def _bake_hair(context, arm, bone_names, intensity, coll_collection=None):
 
     is_loop = _detect_animation_loops(action, frame_start, frame_end)
 
-    # Same non-loop intensity cap as boobs: 1 preroll cycle can't reach
-    # steady-state at high intensity, so cap at 13 to stay controlled.
     eff = intensity if is_loop else min(intensity, 13)
     if eff != intensity:
         _apply_wiggle(context, arm, bone_names, eff)
@@ -392,62 +388,144 @@ def _bake_hair(context, arm, bone_names, intensity, coll_collection=None):
     select_armature(context, arm)
     bpy.ops.object.mode_set(mode='POSE')
 
-    # Wire up real-time collision BEFORE the preroll so the simulation
-    # already avoids body bones during the warm-up cycles.
     if coll_collection:
         _setup_hair_collision_props(arm, bone_names, coll_collection)
 
     arm.wiggle_freeze           = False
-    scene.wiggle.loop           = True
     scene.wiggle.bake_overwrite = True
+    scene.wiggle.loop           = True
     bpy.ops.wiggle.reset()
 
-    # Boost constraint solver iterations for hair chains.
-    # Higher iterations help chains converge (bones pull each other correctly)
-    # and prevent wild over-shooting on long hair strands.
     old_iterations = scene.wiggle.iterations
     scene.wiggle.iterations = max(old_iterations, 10)
 
-    preroll_cycles = 5 if is_loop else 1
-    scene.wiggle.is_preroll = True
+    if is_loop:
+        # --- ITERATIVE BAKE FOR PERFECT LOOP ---
+        # Same approach as boobs: bake from T-pose, let physics state
+        # carry over from frame_end to next pass's frame_start.
+        # Each pass converges. 5 passes gives tight convergence and
+        # eliminates the 1-2 frame settling glitch at the loop seam.
+        max_passes = 5
+        for pass_num in range(max_passes):
+            cur_action = arm.animation_data.action
+            if cur_action and pass_num > 0:
+                strip_physics_keyframes(cur_action, bone_names)
 
-    for _cycle in range(preroll_cycles):
+            if pass_num == 0:
+                bpy.ops.wiggle.reset()
+
+            scene.wiggle.is_preroll = True
+            for f in range(frame_start, frame_end + 1):
+                scene.frame_set(f)
+            scene.wiggle.is_preroll = False
+
+        # Final bake
+        cur_action = arm.animation_data.action
+        if cur_action:
+            strip_physics_keyframes(cur_action, bone_names)
+
+        bpy.ops.wiggle.select()
+        # Protect converged physics state: nla.bake() may internally visit
+        # frame 0, whose handler normally resets all physics.  is_preroll
+        # tells the handler to skip the reset so the loop-steady state
+        # that took 5 preroll passes to build is preserved.
+        # Manual bake for loops (same frame_set path as preroll).
+        # Collect values first, insert keyframes AFTER to avoid interfering
+        # with the physics during the frame_set loop.
+        action = arm.animation_data.action
+        if not action:
+            scene.wiggle.iterations = old_iterations
+            if coll_collection:
+                _clear_hair_collision_props(arm, bone_names)
+            return False, "No action to bake into"
+
+        physics_pbs = [arm.pose.bones[n] for n in bone_names if n and n in arm.pose.bones]
+
+        # Phase 1: run physics and STORE values
+        stored = {}
+        scene.wiggle.is_preroll = True
+
+        # Main cycle
         for f in range(frame_start, frame_end + 1):
             scene.frame_set(f)
+            for pb in physics_pbs:
+                stored[(pb.name, f)] = (
+                    tuple(pb.rotation_quaternion),
+                    tuple(pb.location),
+                    tuple(pb.scale),
+                )
 
-    scene.wiggle.is_preroll = False
+        # Extra settling pass for first frames
+        SETTLE = 8
+        settle_end = min(frame_start + SETTLE, frame_end)
+        for f in range(frame_start, settle_end + 1):
+            scene.frame_set(f)
+            for pb in physics_pbs:
+                stored[(pb.name, f)] = (
+                    tuple(pb.rotation_quaternion),
+                    tuple(pb.location),
+                    tuple(pb.scale),
+                )
 
-    bpy.ops.wiggle.select()
-    try:
-        bpy.ops.nla.bake(
-            frame_start=frame_start, frame_end=frame_end,
-            only_selected=True, visual_keying=True,
-            use_current_action=True, bake_types={'POSE'}
-        )
-    except Exception as e:
-        scene.wiggle.iterations = old_iterations
-        if coll_collection:
-            _clear_hair_collision_props(arm, bone_names)
-        return False, f"Bake failed: {e}"
+        scene.wiggle.is_preroll = False
 
-    # Restore iterations
+        # Phase 2: insert all keyframes at once
+        for bname in bone_names:
+            if not bname:
+                continue
+            for prop, count in [('rotation_quaternion', 4), ('location', 3), ('scale', 3)]:
+                dp = f'pose.bones["{bname}"].{prop}'
+                for i in range(count):
+                    fc = action.fcurves.find(dp, index=i)
+                    if fc is None:
+                        fc = action.fcurves.new(dp, index=i, action_group=bname)
+                    for f in range(frame_start, frame_end + 1):
+                        vals = stored.get((bname, f))
+                        if vals is None:
+                            continue
+                        if prop == 'rotation_quaternion':
+                            val = vals[0][i]
+                        elif prop == 'location':
+                            val = vals[1][i]
+                        else:
+                            val = vals[2][i]
+                        fc.keyframe_points.insert(f, val, options={'FAST', 'REPLACE'})
+                    fc.update()
+    else:
+        # Non-loop: just reset and bake
+        scene.wiggle.loop = False
+        bpy.ops.wiggle.reset()
+        bpy.ops.wiggle.select()
+        try:
+            bpy.ops.nla.bake(
+                frame_start=frame_start, frame_end=frame_end,
+                only_selected=True, visual_keying=True,
+                use_current_action=True, bake_types={'POSE'}
+            )
+        except Exception as e:
+            scene.wiggle.iterations = old_iterations
+            if coll_collection:
+                _clear_hair_collision_props(arm, bone_names)
+            return False, f"Bake failed: {e}"
+
     scene.wiggle.iterations = old_iterations
 
-    # Clear collision props now — keyframes are already baked.
     if coll_collection:
         _clear_hair_collision_props(arm, bone_names)
 
+    # --- Post-bake ---
     action = arm.animation_data.action
     if action:
         smooth_physics_spikes(action, bone_names)
-
-        if is_loop:
-            _velocity_match_loop(action, frame_start, frame_end, bone_names)
-        else:
-            _restore_nonloop_start_to_tpose(action, frame_start, bone_names)
-            _smooth_boundary_frames(action, frame_start, frame_end, bone_names, smooth_ends='start')
         _set_linear_interpolation(action, bone_names)
         _clean_tpose_keyframes(action, bone_names)
+        if is_loop:
+            _copy_loop_end_to_start(action, frame_start, frame_end, bone_names)
+            _fix_quaternion_continuity(action, bone_names)
+        else:
+            _fix_quaternion_continuity(action, bone_names)
+            _restore_nonloop_start_to_tpose(action, frame_start, bone_names)
+            _smooth_boundary_frames(action, frame_start, frame_end, bone_names, smooth_ends='start')
 
     arm.wiggle_freeze = True
     return True, "Baked successfully"
@@ -575,14 +653,10 @@ class HAIR_OT_Preview(Operator):
             if n_fixed:
                 self.report({'INFO'}, f"Collision cleanup: corrected {n_fixed} frames")
 
-            # Re-snap loop seam — collision correction can change the last
-            # frame differently from the first.
-            act = arm.animation_data and arm.animation_data.action
-            if act:
-                fs = max(1, int(act.frame_range[0]))
-                fe = int(act.frame_range[1])
-                if _detect_animation_loops(act, fs, fe):
-                    _force_loop_perfect_match(act, fs, fe, bone_names)
+        # Fix quaternion signs after collision correction
+        act = arm.animation_data and arm.animation_data.action
+        if act:
+            _fix_quaternion_continuity(act, bone_names)
 
         clear_wiggle_from_bones(context, arm, bone_names)
         props.status_text = "Hair preview ready!"
@@ -899,13 +973,10 @@ class HAIR_OT_ApplyToAll(Operator):
                         max_rot_deg=8,
                         precomputed_radii=precomputed_coll_radii,
                     )
-                    # Re-snap loop seam after collision correction.
-                    act = armature_obj.animation_data.action
-                    if act:
-                        fs = max(1, int(act.frame_range[0]))
-                        fe = int(act.frame_range[1])
-                        if _detect_animation_loops(act, fs, fe):
-                            _force_loop_perfect_match(act, fs, fe, bone_names)
+                # Fix quaternion signs after collision correction
+                act = armature_obj.animation_data.action
+                if act:
+                    _fix_quaternion_continuity(act, bone_names)
 
                 out_path = os.path.join(export_dir, f"{anim_item.name}.anm")
                 export_anm.write_anm(out_path, armature_obj, fps)
