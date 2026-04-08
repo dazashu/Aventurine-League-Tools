@@ -11,7 +11,7 @@ import threading
 import tempfile
 import time
 
-REPO_OWNER = "LeagueToolkit"
+REPO_OWNER = "RitoShark"
 REPO_NAME = "Aventurine-League-Tools"
 
 # Shared state for download progress (written by background thread, read by redraw timer)
