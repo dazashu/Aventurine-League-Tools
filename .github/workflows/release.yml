@@ -13,8 +13,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
 
       - name: Get current version
         id: current
@@ -28,38 +26,7 @@ jobs:
           ")
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-      - name: Get previous version
-        id: previous
-        run: |
-          git show HEAD~1:__init__.py > /tmp/prev_init.py 2>/dev/null || echo "" > /tmp/prev_init.py
-          VERSION=$(python3 -c "
-          import re
-          try:
-              with open('/tmp/prev_init.py') as f:
-                  content = f.read()
-              m = re.search(r'\"version\":\s*\((\d+),\s*(\d+),\s*(\d+)\)', content)
-              print(f'{m.group(1)}.{m.group(2)}.{m.group(3)}' if m else '')
-          except:
-              print('')
-          ")
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-
-      - name: Skip if version unchanged
-        id: check
-        run: |
-          CURRENT="${{ steps.current.outputs.version }}"
-          PREVIOUS="${{ steps.previous.outputs.version }}"
-          echo "Current: $CURRENT | Previous: $PREVIOUS"
-          if [ "$CURRENT" = "$PREVIOUS" ]; then
-            echo "changed=false" >> $GITHUB_OUTPUT
-            echo "Version unchanged, skipping release."
-          else
-            echo "changed=true" >> $GITHUB_OUTPUT
-            echo "Version changed from $PREVIOUS to $CURRENT, creating release."
-          fi
-
       - name: Get commit message
-        if: steps.check.outputs.changed == 'true'
         id: commit
         run: |
           echo "message<<EOF" >> $GITHUB_OUTPUT
@@ -67,7 +34,6 @@ jobs:
           echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Build zip
-        if: steps.check.outputs.changed == 'true'
         run: |
           VERSION="${{ steps.current.outputs.version }}"
           BUILD_DIR="/tmp/build/Aventurine"
@@ -88,8 +54,15 @@ jobs:
           cd /tmp/build
           zip -r "$GITHUB_WORKSPACE/Aventurine-${VERSION}.zip" Aventurine
 
+      - name: Delete existing release if same version
+        run: |
+          VERSION="${{ steps.current.outputs.version }}"
+          gh release delete "$VERSION" --yes 2>/dev/null || true
+          git push origin :"refs/tags/$VERSION" 2>/dev/null || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Create release
-        if: steps.check.outputs.changed == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.current.outputs.version }}
