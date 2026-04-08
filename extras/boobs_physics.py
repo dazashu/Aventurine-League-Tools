@@ -24,12 +24,12 @@ from .physics_common import (
 )
 from .wiggle_bake_common import (
     _detect_animation_loops,
-    _force_loop_perfect_match,
+    _copy_loop_end_to_start,
     _restore_nonloop_start_to_tpose,
     _smooth_boundary_frames,
-    _velocity_match_loop,
     _set_linear_interpolation,
     _clean_tpose_keyframes,
+    _fix_quaternion_continuity,
 )
 
 
@@ -180,16 +180,50 @@ class BoobsPhysicsProperties(PropertyGroup):
 #  Bake pipeline
 # ---------------------------------------------------------------------------
 
+def _ramp_physics_params(physics_pbs, target_params, t):
+    """Set physics bone parameters interpolated between stiff/no-movement and target.
+
+    t=0.0 → very stiff (no visible physics), t=1.0 → full target params.
+    Uses the same lerp_exp for perceptually smooth ramp-up.
+    """
+    # "No physics" = very high stiffness + high damping (bone snaps to rest).
+    STIFF_OFF = 2000.0
+    DAMP_OFF  = 50.0
+    MASS_OFF  = 0.1
+    GRAV_OFF  = 0.0
+
+    stiff = lerp_exp(STIFF_OFF, target_params['stiff'], t)
+    damp  = lerp_exp(DAMP_OFF,  target_params['damp'],  t)
+    mass  = lerp_exp(MASS_OFF,  target_params['mass'],  t)
+    grav  = lerp(GRAV_OFF,      target_params['gravity'], t)
+
+    for pb in physics_pbs:
+        pb.wiggle_stiff   = stiff
+        pb.wiggle_damp    = damp
+        pb.wiggle_mass    = mass
+        pb.wiggle_gravity = grav
+
+
 def bake_wiggle_for_current_action(context, armature_obj, bone_names, intensity):
     """Bake wiggle physics into the current action.
 
-    Auto-detects whether the animation loops:
-    - Looping  (idle, walk, dance): 5-cycle preroll + velocity-matched seam.
-    - Non-loop (death, spawn):      1-cycle preroll + T-pose start restoration.
+    Loop animations use a ramp-up convergence approach:
+      1) First preroll pass: physics gradually fades in from 0% to 100%
+         over the animation length (bones start stiff, progressively loosen).
+      2) 3 more preroll passes at full physics: each pass lets the physics
+         state converge so frame_end naturally flows into frame_start.
+      3) Final pass: bake the actual keyframes with fully converged physics.
+    This produces smooth, seamless loops without settling artifacts.
 
-    Always cleans up frame 0 (T-pose) so physics values never bleed in.
+    Non-loop animations: reset physics, bake from rest, ease-in at start.
+
+    The caller is responsible for:
+      - collision correction (if enabled)
+      - re-snapping the loop seam after collision (_force_loop_perfect_match)
+      - fixing quaternion signs as the LAST step (_fix_quaternion_continuity)
     """
     scene = context.scene
+    print(f"[BOOBS BAKE] Starting bake for bones={bone_names}, intensity={intensity}")
 
     if not armature_obj.animation_data or not armature_obj.animation_data.action:
         return False, "No animation loaded on armature"
@@ -197,6 +231,7 @@ def bake_wiggle_for_current_action(context, armature_obj, bone_names, intensity)
     action      = armature_obj.animation_data.action
     frame_start = max(1, int(action.frame_range[0]))
     frame_end   = int(action.frame_range[1])
+    print(f"[BOOBS BAKE] frame_start={frame_start}, frame_end={frame_end}")
 
     if frame_end <= frame_start:
         return False, "Animation has no frames"
@@ -205,8 +240,10 @@ def bake_wiggle_for_current_action(context, armature_obj, bone_names, intensity)
     scene.frame_end   = frame_end
 
     is_loop = _detect_animation_loops(action, frame_start, frame_end)
+    print(f"[BOOBS BAKE] is_loop={is_loop}")
 
-    effective_intensity = intensity if is_loop else min(intensity, 13)
+    # Cap intensity for non-loops (no preroll → less room for error).
+    effective_intensity = intensity if is_loop else min(intensity, 12)
     if effective_intensity != intensity:
         apply_wiggle_to_bones(context, armature_obj, bone_names, effective_intensity)
 
@@ -214,48 +251,163 @@ def bake_wiggle_for_current_action(context, armature_obj, bone_names, intensity)
     bpy.ops.object.mode_set(mode='POSE')
 
     armature_obj.wiggle_freeze = False
-    scene.wiggle.loop           = True
+    scene.wiggle.loop           = is_loop
     scene.wiggle.bake_overwrite = True
 
-    # --- Step 1: Reset physics ---
+    scene.wiggle.loop = True
     bpy.ops.wiggle.reset()
 
-    # --- Step 2: Preroll ---
-    preroll_cycles = 5 if is_loop else 1
-    scene.wiggle.is_preroll = True
+    if is_loop:
+        # --- RAMP-UP CONVERGENCE FOR PERFECT LOOPS ---
+        #
+        # The idea: instead of slamming full physics onto a T-pose and hoping
+        # 5 blind passes converge, we ease the physics in gently:
+        #
+        # Pass 0 (ramp-up): physics starts at 0% (very stiff, no movement)
+        #   and smoothly ramps to 100% over the animation length. This avoids
+        #   the violent initial oscillation from T-pose mismatch and lets the
+        #   spring system gradually find its natural motion.
+        #
+        # Passes 1-3 (convergence): full physics. Each pass feeds frame_end's
+        #   physics state back into frame_start, converging the loop seam.
+        #   After 3 passes the state at frame_end ≈ frame_start.
+        #
+        # Final pass (bake): one more full-physics cycle, this time recording
+        #   the bone transforms for keyframe insertion.
 
-    for _cycle in range(preroll_cycles):
+        target_params = get_jiggle_params(effective_intensity)
+        physics_pbs = [armature_obj.pose.bones[n] for n in bone_names
+                       if n and n in armature_obj.pose.bones]
+        total_frames = frame_end - frame_start
+
+        CONVERGENCE_PASSES = 3   # full-physics preroll passes after ramp
+
+        # --- Pass 0: ramp-up preroll ---
+        bpy.ops.wiggle.reset()
+        scene.wiggle.is_preroll = True
+
         for f in range(frame_start, frame_end + 1):
+            # t goes from 0.0 (start) to 1.0 (end) over the animation
+            t = (f - frame_start) / max(total_frames, 1)
+            # Smooth-step for a more natural ramp (ease-in/ease-out)
+            t = t * t * (3.0 - 2.0 * t)
+            _ramp_physics_params(physics_pbs, target_params, t)
             scene.frame_set(f)
 
-    scene.wiggle.is_preroll = False
+        # Restore full target params for convergence passes
+        _ramp_physics_params(physics_pbs, target_params, 1.0)
+        scene.wiggle.is_preroll = False
+        print(f"[BOOBS BAKE] Loop ramp-up pass done")
 
-    # --- Step 3: Select wiggle bones and bake ---
-    bpy.ops.wiggle.select()
+        # --- Passes 1-3: full-physics convergence ---
+        # Physics state carries over from previous pass's frame_end.
+        # Each pass wraps the loop, converging the seam.
+        for pass_num in range(CONVERGENCE_PASSES):
+            cur_action = armature_obj.animation_data.action
+            if cur_action:
+                strip_physics_keyframes(cur_action, bone_names)
 
-    try:
-        bpy.ops.nla.bake(
-            frame_start=frame_start, frame_end=frame_end,
-            only_selected=True, visual_keying=True,
-            use_current_action=True, bake_types={'POSE'}
-        )
-    except Exception as e:
-        return False, f"NLA bake failed: {e}"
+            scene.wiggle.is_preroll = True
+            for f in range(frame_start, frame_end + 1):
+                scene.frame_set(f)
+            scene.wiggle.is_preroll = False
 
-    # --- Step 4: Post-bake cleanup ---
+            print(f"[BOOBS BAKE] Convergence pass {pass_num + 1}/{CONVERGENCE_PASSES}")
+
+        # --- Final pass: actual bake ---
+        # Physics is now fully converged. One more cycle to record values.
+        cur_action = armature_obj.animation_data.action
+        if cur_action:
+            strip_physics_keyframes(cur_action, bone_names)
+
+        action = armature_obj.animation_data.action
+        if not action:
+            return False, "No action to bake into"
+
+        # IMPORTANT: collect values first, insert keyframes AFTER the loop.
+        # Inserting during the loop would make Blender apply the new keyframes
+        # on subsequent frames, overriding wiggle_pre's identity reset and
+        # breaking the physics (double-application).
+        stored = {}  # (bone_name, frame) -> (quat, loc, scale)
+        scene.wiggle.is_preroll = True
+
+        # Main cycle: frame_start → frame_end
+        for f in range(frame_start, frame_end + 1):
+            scene.frame_set(f)
+            for pb in physics_pbs:
+                stored[(pb.name, f)] = (
+                    tuple(pb.rotation_quaternion),
+                    tuple(pb.location),
+                    tuple(pb.scale),
+                )
+
+        # Settling pass: continue physics past frame_end, wrapping back to
+        # frame_start for a few frames. This overwrites the first frames
+        # with values that are continuous with frame_end's physics state.
+        # Without this, _copy_loop_end_to_start would change frame_start
+        # but frame_start+1 was baked from the ORIGINAL frame_start value,
+        # creating a visible glitch at frame 2.
+        SETTLE = 8
+        settle_end = min(frame_start + SETTLE, frame_end)
+        for f in range(frame_start, settle_end + 1):
+            scene.frame_set(f)
+            for pb in physics_pbs:
+                stored[(pb.name, f)] = (
+                    tuple(pb.rotation_quaternion),
+                    tuple(pb.location),
+                    tuple(pb.scale),
+                )
+
+        scene.wiggle.is_preroll = False
+
+        # Phase 2: insert all keyframes at once
+        for bname in bone_names:
+            if not bname:
+                continue
+            for prop, count in [('rotation_quaternion', 4), ('location', 3), ('scale', 3)]:
+                dp = f'pose.bones["{bname}"].{prop}'
+                for i in range(count):
+                    fc = action.fcurves.find(dp, index=i)
+                    if fc is None:
+                        fc = action.fcurves.new(dp, index=i, action_group=bname)
+                    for f in range(frame_start, frame_end + 1):
+                        vals = stored.get((bname, f))
+                        if vals is None:
+                            continue
+                        if prop == 'rotation_quaternion':
+                            val = vals[0][i]
+                        elif prop == 'location':
+                            val = vals[1][i]
+                        else:
+                            val = vals[2][i]
+                        fc.keyframe_points.insert(f, val, options={'FAST', 'REPLACE'})
+                    fc.update()
+    else:
+        # Non-loop: just reset and bake, physics starts from rest
+        scene.wiggle.loop = False
+        bpy.ops.wiggle.reset()
+        bpy.ops.wiggle.select()
+        try:
+            bpy.ops.nla.bake(
+                frame_start=frame_start, frame_end=frame_end,
+                only_selected=True, visual_keying=True,
+                use_current_action=True, bake_types={'POSE'}
+            )
+        except Exception as e:
+            return False, f"NLA bake failed: {e}"
+
+    # --- Post-bake cleanup ---
     action = armature_obj.animation_data.action
     if action:
+        _set_linear_interpolation(action, bone_names)
+        _clean_tpose_keyframes(action, bone_names)
         if is_loop:
-            _velocity_match_loop(action, frame_start, frame_end, bone_names)
+            _copy_loop_end_to_start(action, frame_start, frame_end, bone_names)
+            _fix_quaternion_continuity(action, bone_names)
         else:
-            # Overwrite frame 1 with T-pose, then ease in over the first few frames.
+            _fix_quaternion_continuity(action, bone_names)
             _restore_nonloop_start_to_tpose(action, frame_start, bone_names)
             _smooth_boundary_frames(action, frame_start, frame_end, bone_names, smooth_ends='start')
-
-        # LINEAR: eliminates BEZIER sub-frame overshoots that cause real-time wobble.
-        _set_linear_interpolation(action, bone_names)
-        # Always clean frame 0 so T-pose bind frame never contains physics data.
-        _clean_tpose_keyframes(action, bone_names)
 
     armature_obj.wiggle_freeze = True
     return True, "Baked successfully"
@@ -421,13 +573,10 @@ class BOOBS_OT_PreviewPhysics(Operator):
             if n_fixed:
                 self.report({'INFO'}, f"Collision: corrected {n_fixed} frames")
 
-            # Re-snap loop seam.
-            act = armature_obj.animation_data and armature_obj.animation_data.action
-            if act:
-                fs = max(1, int(act.frame_range[0]))
-                fe = int(act.frame_range[1])
-                if _detect_animation_loops(act, fs, fe):
-                    _force_loop_perfect_match(act, fs, fe, bone_names)
+        # Fix quaternion signs after collision correction
+        act = armature_obj.animation_data and armature_obj.animation_data.action
+        if act:
+            _fix_quaternion_continuity(act, bone_names)
 
         clear_wiggle_from_bones(context, armature_obj, bone_names)
         props.status_text = "Preview ready — play the animation!"
@@ -736,13 +885,10 @@ class BOOBS_OT_ApplyToAll(Operator):
                         self_coll_enabled=props.boob_self_collision,
                         self_coll_scale=props.boob_self_collision_scale,
                     )
-                    # Re-snap loop seam after collision correction.
-                    act = armature_obj.animation_data.action
-                    if act:
-                        fs = max(1, int(act.frame_range[0]))
-                        fe = int(act.frame_range[1])
-                        if _detect_animation_loops(act, fs, fe):
-                            _force_loop_perfect_match(act, fs, fe, bone_names)
+                # Fix quaternion signs after collision correction
+                act = armature_obj.animation_data.action
+                if act:
+                    _fix_quaternion_continuity(act, bone_names)
 
                 out_path = os.path.join(export_dir, f"{anim_item.name}.anm")
                 export_anm.write_anm(out_path, armature_obj, fps)
