@@ -401,6 +401,10 @@ def _bake_hair(context, arm, bone_names, intensity, coll_collection=None):
     arm.wiggle_freeze           = False
     scene.wiggle.bake_overwrite = True
     scene.wiggle.loop           = True
+
+    # Ensure lastframe starts at 0 so the first bake frame gets a correct
+    # frames_elapsed (1 instead of a wild delta from a previous animation).
+    scene.frame_set(0)
     bpy.ops.wiggle.reset()
 
     old_iterations = scene.wiggle.iterations
@@ -616,9 +620,8 @@ class HAIR_OT_RemoveBone(Operator):
     def execute(self, context):
         props = context.scene.hair_physics
         if props.bones:
-            idx = min(props.active_bone_index, len(props.bones) - 1)
-            props.bones.remove(idx)
-            props.active_bone_index = max(0, idx - 1)
+            props.bones.remove(len(props.bones) - 1)
+            props.active_bone_index = max(0, len(props.bones) - 1)
         return {'FINISHED'}
 
 
@@ -976,6 +979,15 @@ class HAIR_OT_ApplyToAll(Operator):
                 # Hard-reset physics so velocity/position from the previous
                 # animation doesn't bleed into the next preroll.
                 armature_obj.wiggle_freeze = False
+
+                # Jump to frame 0 first so the Wiggle handler resets
+                # lastframe to 0.  Without this, lastframe stays at the
+                # previous animation's frame_end, and the frames_elapsed
+                # calculation on the first frame of the new bake can go
+                # negative (or very large), producing a broken dt that
+                # reverses forces or massively overshoots.
+                context.scene.frame_set(0)
+
                 try:
                     bpy.ops.wiggle.reset()
                 except Exception:
