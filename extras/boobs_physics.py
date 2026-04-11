@@ -864,6 +864,10 @@ class BOOBS_OT_ApplyToAll(Operator):
                 import_anm.apply_anm(anm, armature_obj, frame_offset=0)
                 new_action["lol_anm_filepath"] = anim_item.filepath
 
+                # Strip any imported breast-bone keyframes so the physics
+                # simulation starts from rest pose — same as preview does.
+                strip_physics_keyframes(new_action, bone_names)
+
                 # Re-apply wiggle each iteration: bake_wiggle_for_current_action may
                 # change effective_intensity for non-loop clips, so the next iteration
                 # (which could be a loop) needs the full intensity restored.

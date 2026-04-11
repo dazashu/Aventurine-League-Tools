@@ -220,6 +220,13 @@ def _setup_hair_collision_props(armature_obj, bone_names, coll_collection):
     and push it out if it penetrates. This is real-time collision during the
     simulation — not a post-bake approximation.
     """
+    # Deselect all bones so the update_prop() callback doesn't try to
+    # copy PointerProperty values to other selected bones (the copy
+    # silently fails for PointerProperty, leaving the selected bone with
+    # collider_type='Collection' but collider_collection=None).
+    for bone in armature_obj.data.bones:
+        bone.select = False
+
     arm_mw = armature_obj.matrix_world
     for bname in bone_names:
         if not bname:
@@ -553,6 +560,41 @@ class HAIR_OT_AutoDetectCollisionBones(Operator):
             self.report({'INFO'}, f"Found {len(found)} bones: {', '.join(found)}")
         else:
             self.report({'WARNING'}, "No spine/head/shoulder bones found — enter names manually.")
+        return {'FINISHED'}
+
+
+class HAIR_OT_SelectAllCollisionBones(Operator):
+    """Add all armature bones as colliders, excluding physics bones and utility bones"""
+    bl_idname  = "hair_physics.select_all_collision"
+    bl_label   = "Select All Bones"
+    bl_options = {'REGISTER'}
+
+    # Bone name substrings to exclude (case-insensitive).
+    _EXCLUDE_SUBSTRINGS = ('buffbone', 'snap', 'world', 'root')
+
+    def execute(self, context):
+        props        = context.scene.hair_physics
+        armature_obj = find_armature(context)
+        if not armature_obj:
+            self.report({'ERROR'}, "No armature found"); return {'CANCELLED'}
+
+        # Bones used for hair physics — these should not collide with themselves.
+        physics_bones = {b.lower() for b in _get_bone_names(props) if b}
+
+        coll_bones = []
+        for bone in armature_obj.pose.bones:
+            bl = bone.name.lower()
+            if bl in physics_bones:
+                continue
+            if any(sub in bl for sub in self._EXCLUDE_SUBSTRINGS):
+                continue
+            coll_bones.append(bone.name)
+
+        if coll_bones:
+            props.collision_bones = ", ".join(coll_bones)
+            self.report({'INFO'}, f"Added {len(coll_bones)} collision bones")
+        else:
+            self.report({'WARNING'}, "No eligible bones found")
         return {'FINISHED'}
 
 
@@ -948,6 +990,10 @@ class HAIR_OT_ApplyToAll(Operator):
                 import_anm.apply_anm(anm, armature_obj, frame_offset=0)
                 new_action["lol_anm_filepath"] = anim_item.filepath
 
+                # Strip any imported hair-bone keyframes so the physics
+                # simulation starts from rest pose — same as preview does.
+                strip_physics_keyframes(new_action, bone_names)
+
                 # Re-apply wiggle each iteration: _bake_hair may lower effective
                 # intensity for non-loop clips, so loops that follow need it reset.
                 _apply_wiggle(context, armature_obj, bone_names, props.jiggle_intensity)
@@ -1104,6 +1150,8 @@ class HAIR_PT_Physics(Panel):
             col = box.column(align=True)
             col.label(text="Collision Bones (comma-separated):", icon='BONE_DATA')
             col.prop(props, "collision_bones", text="")
+            col.operator("hair_physics.select_all_collision",
+                         text="Select All Bones", icon='GROUP_BONE')
             col.operator("hair_physics.auto_detect_collision",
                          text="Auto-Detect Arm Bones", icon='VIEWZOOM')
             col.separator()
@@ -1188,6 +1236,7 @@ classes = [
     HairAnimListItem,
     HairPhysicsProperties,
     HAIR_OT_AutoDetectCollisionBones,
+    HAIR_OT_SelectAllCollisionBones,
     HAIR_OT_AddBone,
     HAIR_OT_RemoveBone,
     HAIR_OT_Preview,
